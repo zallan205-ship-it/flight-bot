@@ -13,7 +13,6 @@ Scheduler principale (APScheduler). Tre job:
    interroga entrambi gli scraper, salva gli snapshot, valuta gli alert.
 3. weekly_recalibration (settimanale): richiama calibration.recalibrate.
 """
-import asyncio
 import logging
 from datetime import datetime, timedelta
 
@@ -181,8 +180,7 @@ def start_scheduler() -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler()
     scheduler.add_job(discover_new_weekends, "cron", hour=3, minute=0)
     scheduler.add_job(deactivate_expired_searches, "cron", hour=3, minute=30)
-    scheduler.add_job(lambda: asyncio.create_task(run_scraping_cycle()),
-                       "interval", minutes=SCRAPE_INTERVAL_MINUTES_AUTO)
+    scheduler.add_job(run_scraping_cycle, "interval", minutes=SCRAPE_INTERVAL_MINUTES_AUTO)
     scheduler.add_job(weekly_recalibration, "cron", day_of_week="mon", hour=4, minute=0)
     scheduler.start()
     return scheduler
