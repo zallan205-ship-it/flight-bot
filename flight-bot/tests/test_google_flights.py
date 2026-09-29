@@ -4,7 +4,7 @@ Test suite per Google Flights scraper - test_google_flights.py
 Verifica il comportamento attuale dello scraper con mock di tutte le dipendenze esterne.
 """
 import pytest
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import Mock, MagicMock, patch, call
 from datetime import datetime
 
 # Importa le funzioni e classi da testare
@@ -416,12 +416,11 @@ class TestMaxPerLeg:
     """TEST 12: Verifica max_per_leg limita le opzioni per tratta."""
     
     @patch("scrapers.google_flights.search_leg")
-    def test_search_options_max_per_leg(self, mock_search_leg):
-        """max_per_leg=2 limita le opzioni considerate per ciascuna tratta"""
+    def test_search_options_max_per_leg_passed_to_search_leg(self, mock_search_leg):
+        """max_per_leg=2 viene passato a search_leg() come max_results"""
         departure = datetime(2026, 12, 25)
         return_date = datetime(2026, 12, 31)
         
-        # Se max_per_leg=2, search_leg dovrebbe restituire max 2 opzioni
         andata_options = [
             LegOption(price_eur=30.0, time="08:00", airlines=["Ryanair"], stops=0),
             LegOption(price_eur=40.0, time="18:00", airlines=["Air France"], stops=0),
@@ -436,7 +435,17 @@ class TestMaxPerLeg:
         
         result = search_options("PSA", "CAG", departure, return_date=return_date, max_per_leg=2)
         
-        # Con max_per_leg=2: max 2*2=4 combinazioni
+        # Verifica che search_leg sia stato chiamato con max_results=2
+        assert mock_search_leg.call_count == 2
+        
+        # Verifica i parametri delle due chiamate
+        calls = mock_search_leg.call_args_list
+        # Prima chiamata (andata): max_results=2
+        assert calls[0].kwargs.get('max_results') == 2
+        # Seconda chiamata (ritorno): max_results=2
+        assert calls[1].kwargs.get('max_results') == 2
+        
+        # Verifica risultato finale
         assert len(result) <= 4
 
 
