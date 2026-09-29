@@ -4,6 +4,7 @@ Test suite per Google Flights scraper - test_google_flights.py
 Verifica il comportamento attuale dello scraper con mock di tutte le dipendenze esterne.
 """
 import inspect
+from types import SimpleNamespace
 
 import pytest
 import primp
@@ -252,6 +253,67 @@ class TestMaxResults:
         assert result[1].price_eur == 75.0
 
 
+def _parsed_flight(price, airlines, *segment_times):
+    """Itinerario nella forma che search_leg legge da fast_flights.parse():
+    .price, .airlines, .flights[i].departure.time. SimpleNamespace (non Mock):
+    se il codice legge un attributo non previsto il test fallisce."""
+    return SimpleNamespace(
+        price=f"{price:.2f}",
+        airlines=airlines,
+        flights=[SimpleNamespace(departure=SimpleNamespace(time=t)) for t in segment_times],
+    )
+
+
+class TestSearchLegFieldMapping:
+    """TEST 18: search_leg() mappa correttamente orario e compagnie di ogni volo."""
+
+    @patch("scrapers.google_flights._fetch_html")
+    @patch("scrapers.google_flights.parse")
+    def test_search_leg_maps_first_segment_time_and_airlines(self, mock_parse, mock_fetch_html):
+        # Volo con scalo: due segmenti con orari diversi. L'orario del volo e'
+        # quello di partenza del PRIMO segmento (06:10), non dell'ultimo (09:45).
+        connecting = _parsed_flight(120, ["Lufthansa", "ITA Airways"], (6, 10), (9, 45))
+        direct = _parsed_flight(60, ["Ryanair"], (18, 30))
+        # Ordine volutamente non ordinato per prezzo.
+        mock_parse.return_value = [connecting, direct]
+        mock_fetch_html.return_value = "<html></html>"
+
+        result = search_leg("PSA", "CAG", datetime(2026, 12, 25))
+
+        assert result == [
+            LegOption(price_eur=60.0, time="18:30", airlines=["Ryanair"], stops=0),
+            LegOption(price_eur=120.0, time="06:10",
+                      airlines=["Lufthansa", "ITA Airways"], stops=1),
+        ]
+
+
+class TestSearchLegQueryFilters:
+    """TEST 19: search_leg() propaga tratta, data e filtri orari alla query."""
+
+    @patch("scrapers.google_flights.parse")
+    @patch("scrapers.google_flights._fetch_html")
+    @patch("scrapers.google_flights._build_one_way_query")
+    def test_search_leg_passes_route_date_and_hour_filters_to_query(
+            self, mock_build_query, mock_fetch_html, mock_parse):
+        date = datetime(2026, 12, 25)
+        query = object()
+        mock_build_query.return_value = query
+        mock_parse.return_value = []
+
+        search_leg("PSA", "CAG", date, earliest_hour=6, latest_hour=12)
+
+        mock_build_query.assert_called_once()
+        assert _bound_args(mock_build_query.call_args, _build_one_way_query) == {
+            "origin": "PSA",
+            "destination": "CAG",
+            "date": date,
+            "earliest_hour": 6,
+            "latest_hour": 12,
+        }
+        # La query costruita e' proprio quella usata per scaricare la pagina.
+        mock_fetch_html.assert_called_once_with(query)
+
+
 class TestScrapePriceOneWay:
     """TEST 6: Verifica scrape_price() per ricerca one-way."""
     
@@ -281,10 +343,12 @@ class TestScrapePriceOneWay:
         assert result.source == "google_flights"
 
 
-def _bound_args(mock_call):
-    """Normalizza una call a search_leg in {nome_parametro: valore}, sia che
-    scrape_price passi gli argomenti in modo posizionale o per keyword."""
-    bound = inspect.signature(search_leg).bind(*mock_call.args, **mock_call.kwargs)
+def _bound_args(mock_call, func=None):
+    """Normalizza una call in {nome_parametro: valore} usando la firma reale di
+    `func` (default: search_leg), sia che il chiamante passi gli argomenti in
+    modo posizionale o per keyword."""
+    func = func or search_leg
+    bound = inspect.signature(func).bind(*mock_call.args, **mock_call.kwargs)
     bound.apply_defaults()
     return dict(bound.arguments)
 
@@ -554,6 +618,138 @@ class TestSearchOptionsMaxResults:
         
         # max_results=3 limita il risultato finale
         assert len(result) <= 3
+
+
+class TestSearchOptionsRoundTripMapping:
+    """
+    TEST 20: search_options() round-trip con fake di search_leg che risponde
+    per (origin, destination, date) e non per ordine di chiamata.
+    """
+
+    DEPARTURE = datetime(2026, 12, 25)
+    RETURN = datetime(2026, 12, 31)
+
+    OUT_CHEAP = LegOption(price_eur=50.0, time="18:30", airlines=["Ryanair"], stops=0)
+    OUT_PRICEY = LegOption(price_eur=80.0, time="07:00", airlines=["ITA Airways"], stops=0)
+    RET_CHEAP = LegOption(price_eur=70.0, time="20:15", airlines=["Wizz Air"], stops=0)
+    RET_PRICEY = LegOption(price_eur=90.0, time="06:10", airlines=["Volotea"], stops=0)
+
+    def _table(self):
+        return {
+            ("PSA", "CAG", self.DEPARTURE): [self.OUT_CHEAP, self.OUT_PRICEY],
+            ("CAG", "PSA", self.RETURN): [self.RET_CHEAP, self.RET_PRICEY],
+        }
+
+    @patch("scrapers.google_flights.search_leg")
+    def test_combinations_use_correct_leg_times_airlines_and_prices(self, mock_search_leg):
+        mock_search_leg.side_effect = _leg_router(self._table())
+
+        result = search_options("PSA", "CAG", self.DEPARTURE, return_date=self.RETURN)
+
+        # Se il ritorno venisse cercato su PSA->CAG il router non troverebbe la
+        # chiave e il test fallirebbe. departure_time viene dall'andata,
+        # return_time dal ritorno, le compagnie sono l'unione ordinata.
+        assert result == [
+            FlightOption(price_eur=120.0, departure_time="18:30", return_time="20:15",
+                         airlines=["Ryanair", "Wizz Air"]),
+            FlightOption(price_eur=140.0, departure_time="18:30", return_time="06:10",
+                         airlines=["Ryanair", "Volotea"]),
+            FlightOption(price_eur=150.0, departure_time="07:00", return_time="20:15",
+                         airlines=["ITA Airways", "Wizz Air"]),
+            FlightOption(price_eur=170.0, departure_time="07:00", return_time="06:10",
+                         airlines=["ITA Airways", "Volotea"]),
+        ]
+
+    @patch("scrapers.google_flights.search_leg")
+    def test_both_legs_are_searched_for_direct_flights_only(self, mock_search_leg):
+        mock_search_leg.side_effect = _leg_router(self._table())
+
+        search_options("PSA", "CAG", self.DEPARTURE, return_date=self.RETURN)
+
+        assert mock_search_leg.call_count == 2
+        outbound_call = _bound_args(mock_search_leg.call_args_list[0])
+        return_call = _bound_args(mock_search_leg.call_args_list[1])
+
+        assert (outbound_call["origin"], outbound_call["destination"], outbound_call["date"]) == (
+            "PSA", "CAG", self.DEPARTURE)
+        assert outbound_call["direct_only"] is True
+
+        assert (return_call["origin"], return_call["destination"], return_call["date"]) == (
+            "CAG", "PSA", self.RETURN)
+        assert return_call["direct_only"] is True
+
+    @patch("scrapers.google_flights.search_leg")
+    def test_empty_return_leg_returns_empty_list(self, mock_search_leg):
+        table = self._table()
+        table[("CAG", "PSA", self.RETURN)] = []
+        mock_search_leg.side_effect = _leg_router(table)
+
+        result = search_options("PSA", "CAG", self.DEPARTURE, return_date=self.RETURN)
+
+        # Niente combinazioni "solo andata" quando il ritorno non esiste.
+        assert result == []
+
+
+class TestSearchOptionsMaxResultsExact:
+    """TEST 21: max_results tronca ESATTAMENTE a N quando i risultati bastano."""
+
+    DEPARTURE = datetime(2026, 12, 25)
+    RETURN = datetime(2026, 12, 31)
+
+    @patch("scrapers.google_flights.search_leg")
+    def test_one_way_max_results_returns_exactly_n_cheapest(self, mock_search_leg):
+        legs = [
+            LegOption(price_eur=30.0, time="08:00", airlines=["Ryanair"], stops=0),
+            LegOption(price_eur=40.0, time="12:15", airlines=["Vueling"], stops=0),
+            LegOption(price_eur=50.0, time="16:40", airlines=["Wizz Air"], stops=0),
+            LegOption(price_eur=60.0, time="21:05", airlines=["Volotea"], stops=0),
+        ]
+        mock_search_leg.side_effect = _leg_router({("PSA", "CAG", self.DEPARTURE): legs})
+
+        result = search_options("PSA", "CAG", self.DEPARTURE, max_results=2)
+
+        assert len(result) == 2
+        assert result == [
+            FlightOption(price_eur=30.0, departure_time="08:00", return_time=None,
+                         airlines=["Ryanair"]),
+            FlightOption(price_eur=40.0, departure_time="12:15", return_time=None,
+                         airlines=["Vueling"]),
+        ]
+
+    @patch("scrapers.google_flights.search_leg")
+    def test_round_trip_max_results_returns_exactly_n_cheapest_combinations(self, mock_search_leg):
+        outbound = [
+            LegOption(price_eur=30.0, time="08:00", airlines=["Ryanair"], stops=0),
+            LegOption(price_eur=47.0, time="12:30", airlines=["Vueling"], stops=0),
+            LegOption(price_eur=100.0, time="17:45", airlines=["ITA Airways"], stops=0),
+        ]
+        inbound = [
+            LegOption(price_eur=20.0, time="09:15", airlines=["Wizz Air"], stops=0),
+            LegOption(price_eur=33.0, time="13:05", airlines=["Volotea"], stops=0),
+            LegOption(price_eur=95.0, time="21:40", airlines=["Aegean"], stops=0),
+        ]
+        mock_search_leg.side_effect = _leg_router({
+            ("PSA", "CAG", self.DEPARTURE): outbound,
+            ("CAG", "PSA", self.RETURN): inbound,
+        })
+
+        result = search_options("PSA", "CAG", self.DEPARTURE,
+                                return_date=self.RETURN, max_results=4)
+
+        # 3 x 3 = 9 combinazioni: 50, 63, 67, 80, 120, 125, 133, 142, 195.
+        # Nell'ordine di generazione le prime 4 sarebbero 50, 63, 125, 67:
+        # il test distingue "le 4 piu' economiche" da "le prime 4 generate".
+        assert len(result) == 4
+        assert result == [
+            FlightOption(price_eur=50.0, departure_time="08:00", return_time="09:15",
+                         airlines=["Ryanair", "Wizz Air"]),
+            FlightOption(price_eur=63.0, departure_time="08:00", return_time="13:05",
+                         airlines=["Ryanair", "Volotea"]),
+            FlightOption(price_eur=67.0, departure_time="12:30", return_time="09:15",
+                         airlines=["Vueling", "Wizz Air"]),
+            FlightOption(price_eur=80.0, departure_time="12:30", return_time="13:05",
+                         airlines=["Volotea", "Vueling"]),
+        ]
 
 
 class TestFlightsNotFound:
