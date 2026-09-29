@@ -3,7 +3,10 @@ Test suite per Google Flights scraper - test_google_flights.py
 
 Verifica il comportamento attuale dello scraper con mock di tutte le dipendenze esterne.
 """
+import inspect
+
 import pytest
+import primp
 from unittest.mock import Mock, MagicMock, patch, call
 from datetime import datetime
 
@@ -278,39 +281,78 @@ class TestScrapePriceOneWay:
         assert result.source == "google_flights"
 
 
+def _bound_args(mock_call):
+    """Normalizza una call a search_leg in {nome_parametro: valore}, sia che
+    scrape_price passi gli argomenti in modo posizionale o per keyword."""
+    bound = inspect.signature(search_leg).bind(*mock_call.args, **mock_call.kwargs)
+    bound.apply_defaults()
+    return dict(bound.arguments)
+
+
+def _leg_router(table):
+    """
+    Fake di search_leg che sceglie la risposta in base a (origin, destination,
+    date) e NON all'ordine delle chiamate: se scrape_price scambia le tratte o
+    usa la data sbagliata, il test fallisce invece di passare per caso.
+    """
+    def fake(origin, destination, date, earliest_hour=None, latest_hour=None,
+             direct_only=False, max_results=None):
+        return table[(origin, destination, date)]
+    return fake
+
+
 class TestScrapePriceRoundTrip:
     """TEST 7: Verifica scrape_price() per ricerca round-trip."""
-    
+
     @patch("scrapers.google_flights.search_leg")
     def test_scrape_price_round_trip(self, mock_search_leg):
-        """Andata €30 + Ritorno €25 = €55"""
+        """
+        Andata (PSA->CAG) 50 EUR 18:30, ritorno (CAG->PSA) 70 EUR 20:15.
+        Prezzo, orari e mapping delle tratte devono restare distinti.
+        """
         departure = datetime(2026, 12, 25)
         return_date = datetime(2026, 12, 31)
-        
-        # Primo call (andata)
-        leg_andata = LegOption(
-            price_eur=30.0,
-            time="08:00",
-            airlines=["Ryanair"],
-            stops=0
+
+        outbound = LegOption(price_eur=50.0, time="18:30", airlines=["Ryanair"], stops=0)
+        outbound_pricier = LegOption(price_eur=90.0, time="07:00", airlines=["ITA"], stops=0)
+        inbound = LegOption(price_eur=70.0, time="20:15", airlines=["Wizz Air"], stops=0)
+        inbound_pricier = LegOption(price_eur=95.0, time="06:10", airlines=["ITA"], stops=0)
+
+        mock_search_leg.side_effect = _leg_router({
+            ("PSA", "CAG", departure): [outbound, outbound_pricier],
+            ("CAG", "PSA", return_date): [inbound, inbound_pricier],
+        })
+
+        result = scrape_price(
+            "PSA", "CAG", departure, return_date=return_date,
+            earliest_departure_hour=6, latest_departure_hour=12,
+            earliest_return_hour=17, latest_return_hour=22,
+            direct_only=True,
         )
-        # Secondo call (ritorno)
-        leg_ritorno = LegOption(
-            price_eur=25.0,
-            time="19:00",
-            airlines=["Ryanair"],
-            stops=0
-        )
-        
-        mock_search_leg.side_effect = [[leg_andata], [leg_ritorno]]
-        
-        result = scrape_price("PSA", "CAG", departure, return_date=return_date)
-        
+
         assert result is not None
-        assert result.price_eur == 55.0
-        assert result.departure_time == "08:00"
-        assert result.return_time == "19:00"
+        # 50 + 70: distinguibile da 50+50 (100), 70+70 (140), 50+90 (140), ecc.
+        assert result.price_eur == 120.0
+        assert result.departure_time == "18:30"
+        assert result.return_time == "20:15"
+        assert result.origin == "PSA"
+        assert result.destination == "CAG"
+        assert result.departure_date == departure
         assert result.return_date == return_date
+        assert result.source == "google_flights"
+
+        # Mapping delle due ricerche: tratta, data, filtri orari e direct_only
+        assert mock_search_leg.call_count == 2
+        first = _bound_args(mock_search_leg.call_args_list[0])
+        second = _bound_args(mock_search_leg.call_args_list[1])
+
+        assert (first["origin"], first["destination"], first["date"]) == ("PSA", "CAG", departure)
+        assert (first["earliest_hour"], first["latest_hour"]) == (6, 12)
+        assert first["direct_only"] is True
+
+        assert (second["origin"], second["destination"], second["date"]) == ("CAG", "PSA", return_date)
+        assert (second["earliest_hour"], second["latest_hour"]) == (17, 22)
+        assert second["direct_only"] is True
 
 
 class TestScrapePriceReturnMissing:
@@ -348,6 +390,42 @@ class TestScrapePriceDepartureMissing:
         
         result = scrape_price("PSA", "CAG", departure)
         
+        assert result is None
+
+
+class TestScrapePriceMissingLegsRoundTrip:
+    """
+    TEST 8b: comportamento ATTUALE di scrape_price() se una sola tratta di una
+    ricerca round-trip e' vuota: ritorna None (nessun risultato parziale).
+    """
+
+    DEPARTURE = datetime(2026, 12, 25)
+    RETURN = datetime(2026, 12, 31)
+    VALID_OUT = LegOption(price_eur=50.0, time="18:30", airlines=["Ryanair"], stops=0)
+    VALID_RET = LegOption(price_eur=70.0, time="20:15", airlines=["Wizz Air"], stops=0)
+
+    @patch("scrapers.google_flights.search_leg")
+    def test_outbound_empty_return_valid_returns_none(self, mock_search_leg):
+        """outbound = [], return = [valido] -> None"""
+        mock_search_leg.side_effect = _leg_router({
+            ("PSA", "CAG", self.DEPARTURE): [],
+            ("CAG", "PSA", self.RETURN): [self.VALID_RET],
+        })
+
+        result = scrape_price("PSA", "CAG", self.DEPARTURE, return_date=self.RETURN)
+
+        assert result is None
+
+    @patch("scrapers.google_flights.search_leg")
+    def test_outbound_valid_return_empty_returns_none(self, mock_search_leg):
+        """outbound = [valido], return = [] -> None (non un prezzo di sola andata)"""
+        mock_search_leg.side_effect = _leg_router({
+            ("PSA", "CAG", self.DEPARTURE): [self.VALID_OUT],
+            ("CAG", "PSA", self.RETURN): [],
+        })
+
+        result = scrape_price("PSA", "CAG", self.DEPARTURE, return_date=self.RETURN)
+
         assert result is None
 
 
@@ -608,6 +686,62 @@ class TestSubmitConsentForm:
         assert len(calls) > 0
         posted_url = calls[0][0][0]
         assert posted_url == "https://consent.google.com/consent_submit"
+
+
+class TestSubmitConsentFormRealParsing:
+    """
+    TEST 15b: _submit_consent_form() eseguita per intero, con parsing HTML
+    reale (selectolax, la libreria usata dal codice di produzione). Si mocka
+    solo il POST di rete (primp.Client.post).
+    """
+
+    CONSENT_HTML = """
+    <html><body>
+      <form action="/save" method="POST">
+        <input type="hidden" name="gl" value="IT">
+        <input type="hidden" name="set_eom" value="true">
+        <input type="hidden" name="bl" value="boq_identityfrontenduiserver_REJECT">
+        <button type="submit">Rifiuta tutto</button>
+      </form>
+      <form action="/save" method="POST">
+        <input type="hidden" name="gl" value="IT">
+        <input type="hidden" name="m" value="0">
+        <input type="hidden" name="continue" value="https://www.google.com/travel/flights?hl=it">
+        <input type="hidden" name="set_eom" value="false">
+        <input type="hidden" name="bl" value="boq_identityfrontenduiserver_ACCEPT">
+        <input type="checkbox" name="remember" value="on">
+        <input type="text" name="empty_value_field">
+        <input type="submit" value="ignored: no name attribute">
+        <button type="submit">Accetta tutto</button>
+      </form>
+    </body></html>
+    """
+
+    def test_parses_accept_form_and_posts_its_fields(self):
+        with patch.object(primp.Client, "post") as mock_post:
+            mock_post.return_value = Mock(text="<html>risultati</html>")
+
+            result = _submit_consent_form(self.CONSENT_HTML)
+
+        assert result == "<html>risultati</html>"
+        mock_post.assert_called_once()
+        args, kwargs = mock_post.call_args
+
+        # action relativa risolta contro consent.google.com
+        assert args == ("https://consent.google.com/save",)
+
+        # Dati del form "Accetta" (non quelli del form "Rifiuta"): hidden +
+        # altri input con name; l'input senza name e' escluso, il value
+        # mancante diventa stringa vuota.
+        assert kwargs == {"data": {
+            "gl": "IT",
+            "m": "0",
+            "continue": "https://www.google.com/travel/flights?hl=it",
+            "set_eom": "false",
+            "bl": "boq_identityfrontenduiserver_ACCEPT",
+            "remember": "on",
+            "empty_value_field": "",
+        }}
 
 
 class TestFetchHtml:
