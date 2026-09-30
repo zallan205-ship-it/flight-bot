@@ -44,7 +44,7 @@ stesso processo (client HTTP condiviso a livello di modulo).
 from dataclasses import dataclass
 from datetime import datetime
 
-from primp import Client
+from primp import Client, PrimpError
 from selectolax.lexbor import LexborHTMLParser
 from fast_flights import FlightQuery, Passengers, create_filter
 from fast_flights.parser import parse
@@ -66,6 +66,41 @@ _client = Client(
 )
 
 
+class ScraperError(RuntimeError):
+    """
+    Errore TECNICO durante il recupero o l'analisi di una pagina Google Flights
+    (rete, risposta HTTP 4xx/5xx, consenso, pagina non interpretabile).
+
+    NON significa "nessun volo trovato": quel caso resta [] / None secondo il
+    contratto di search_leg / scrape_price / search_options. Estende
+    RuntimeError perche' il codice di consenso sollevava gia' RuntimeError.
+    L'eccezione originale e' sempre disponibile in `__cause__`.
+    """
+
+
+def _request(method: str, url: str, **kwargs):
+    """
+    GET/POST con il client condiviso. Un errore di rete (timeout, connessione,
+    DNS...) o una risposta HTTP 4xx/5xx solleva ScraperError e non arriva mai
+    al parser: primp, di suo, restituisce le risposte 429/503 come se fossero
+    normali, quindi lo status va controllato esplicitamente.
+    """
+    try:
+        response = getattr(_client, method)(url, **kwargs)
+    except PrimpError as exc:
+        raise ScraperError(
+            f"Richiesta {method.upper()} a Google fallita ({type(exc).__name__})"
+        ) from exc
+    try:
+        response.raise_for_status()
+    except PrimpError as exc:
+        raise ScraperError(
+            f"Google ha risposto con errore HTTP "
+            f"{getattr(response, 'status_code', '?')} alla richiesta {method.upper()}"
+        ) from exc
+    return response
+
+
 @dataclass
 class LegOption:
     """Una singola opzione per UNA tratta (sola andata o solo ritorno)."""
@@ -84,7 +119,7 @@ def _submit_consent_form(consent_html: str) -> str:
     consent_page = LexborHTMLParser(consent_html)
     forms = consent_page.css("form")
     if not forms:
-        raise RuntimeError(
+        raise ScraperError(
             "Pagina di consenso Google senza nessun <form>: struttura della "
             "pagina cambiata rispetto a quella vista in fase di test."
         )
@@ -100,7 +135,7 @@ def _submit_consent_form(consent_html: str) -> str:
 
     action = modulo.attributes.get("action")
     if not action:
-        raise RuntimeError("Il modulo di consenso non ha un URL di invio (action).")
+        raise ScraperError("Il modulo di consenso non ha un URL di invio (action).")
     if action.startswith("/"):
         action = "https://consent.google.com" + action
 
@@ -110,12 +145,12 @@ def _submit_consent_form(consent_html: str) -> str:
         if nome:
             campi[nome] = inp.attributes.get("value", "")
 
-    response = _client.post(action, data=campi)
+    response = _request("post", action, data=campi)
     return response.text
 
 
 def _fetch_html(query) -> str:
-    response = _client.get(GOOGLE_FLIGHTS_URL, params=query.params())
+    response = _request("get", GOOGLE_FLIGHTS_URL, params=query.params())
 
     if "consent.google.com" in response.url:
         return _submit_consent_form(response.text)
@@ -159,6 +194,9 @@ def search_leg(origin: str, destination: str, date: datetime,
     crescente. È la funzione di base su cui si appoggiano sia scrape_price()
     (che prende solo la più economica) sia search_options() per /cerca (che
     ne mostra diverse per costruire le combinazioni andata×ritorno).
+
+    Nessun volo -> []. Errore tecnico (rete, HTTP, consenso, parsing) ->
+    ScraperError: i due casi non vanno mai confusi.
     """
     query = _build_one_way_query(origin, destination, date, earliest_hour, latest_hour)
 
@@ -166,7 +204,16 @@ def search_leg(origin: str, destination: str, date: datetime,
         html = _fetch_html(query)
         result = parse(html)
     except FlightsNotFound:
+        # Contratto invariato: per fast-flights e' "nessun volo" (il suo parse()
+        # la solleva su un payload di errore di Google). Non verificato con
+        # dati reali se questo payload possa anche indicare un errore transitorio.
         return []
+    except ScraperError:
+        raise
+    except Exception as exc:
+        raise ScraperError(
+            f"Analisi della pagina Google Flights fallita ({type(exc).__name__})"
+        ) from exc
 
     opzioni = []
     for f in result:
@@ -198,6 +245,9 @@ def scrape_price(origin: str, destination: str, departure_date: datetime,
     Andata e ritorno sono cercate come tratte indipendenti (vedi nota in cima
     al file) e il prezzo totale è la somma delle due tariffe più economiche
     che rispettano i filtri richiesti.
+
+    None = nessun risultato. Un errore tecnico solleva ScraperError (vedi
+    search_leg): non viene mai convertito in None.
     """
     andata = search_leg(origin, destination, departure_date,
                          earliest_departure_hour, latest_departure_hour, direct_only)
@@ -244,6 +294,9 @@ def search_options(origin: str, destination: str, departure_date: datetime,
     max_per_leg²), non solo l'abbinamento più economico — così puoi scegliere
     anche una combinazione che non è la più conveniente in assoluto, se ti fa
     comodo un orario diverso.
+
+    [] = nessuna opzione. Un errore tecnico solleva ScraperError (vedi
+    search_leg): non viene mai convertito in [].
     """
     andata = search_leg(origin, destination, departure_date, direct_only=True,
                          max_results=max_per_leg)
