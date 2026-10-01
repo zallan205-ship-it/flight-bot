@@ -15,15 +15,19 @@ parse() distingue nella versione di fast-flights attualmente in uso.
 """
 import json
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import primp
 import pytest
 
 from scrapers.google_flights import (
+    GOOGLE_FLIGHTS_URL,
+    HTTP_TIMEOUT_SECONDS,
     ScraperError,
     LegOption,
     _fetch_html,
+    _request,
     _submit_consent_form,
     scrape_price,
     search_leg,
@@ -195,7 +199,8 @@ class TestConsentTechnicalFailures:
 
         assert _fetch_html(_query()) == "<html>risultati</html>"
         mock_client.post.assert_called_once_with(
-            "https://consent.google.com/save", data={"gl": "IT"})
+            "https://consent.google.com/save",
+            timeout=HTTP_TIMEOUT_SECONDS, data={"gl": "IT"})
 
 
 # -------------------------------------------------------------- 3. parser ----
@@ -380,3 +385,186 @@ class TestScraperErrorType:
         assert issubclass(ScraperError, RuntimeError)
         assert not issubclass(ScraperError, FlightsNotFound)
         assert not issubclass(FlightsNotFound, ScraperError)
+
+
+# ------------------------------------------------------------- timeout HTTP ---
+
+class TestHttpTimeoutIsApplied:
+    """
+    Ogni richiesta HTTP (GET dei risultati, POST del consenso) passa a primp un
+    timeout esplicito. Il valore e' scritto in chiaro (30) di proposito: se
+    cambia, questi test devono fallire. Verificato a mano contro un server
+    locale con primp 2.0.1: get/post accettano `timeout=` (int o float) e lo
+    applicano all'intera richiesta, corpo della risposta compreso.
+    """
+
+    def test_timeout_constant_is_30_seconds(self):
+        assert HTTP_TIMEOUT_SECONDS == 30
+
+    @patch("scrapers.google_flights._client")
+    def test_get_passes_timeout_30(self, mock_client):
+        mock_client.get.return_value = _response()
+
+        _request("get", "https://example.test/flights", params={"q": "x"})
+
+        mock_client.get.assert_called_once_with(
+            "https://example.test/flights", timeout=30, params={"q": "x"})
+        assert mock_client.get.call_args.kwargs["timeout"] == 30
+
+    @patch("scrapers.google_flights._client")
+    def test_post_passes_timeout_30(self, mock_client):
+        mock_client.post.return_value = _response()
+
+        _request("post", "https://example.test/save", data={"a": "b"})
+
+        mock_client.post.assert_called_once_with(
+            "https://example.test/save", timeout=30, data={"a": "b"})
+        assert mock_client.post.call_args.kwargs["timeout"] == 30
+
+    @patch("scrapers.google_flights._client")
+    def test_fetch_html_get_has_timeout_30(self, mock_client):
+        mock_client.get.return_value = _response(text="<html>voli</html>")
+
+        _fetch_html(_query())
+
+        mock_client.get.assert_called_once_with(
+            GOOGLE_FLIGHTS_URL, timeout=30, params={})
+
+    @patch("scrapers.google_flights._client")
+    def test_consent_form_post_has_timeout_30(self, mock_client):
+        mock_client.post.return_value = _response(text="<html>risultati</html>")
+
+        _submit_consent_form(CONSENT_HTML)
+
+        mock_client.post.assert_called_once_with(
+            "https://consent.google.com/save", timeout=30, data={"gl": "IT"})
+
+    @patch("scrapers.google_flights._client")
+    def test_consent_path_through_fetch_html_uses_timeout_on_both_requests(self, mock_client):
+        mock_client.get.return_value = _response(text=CONSENT_HTML, url=CONSENT_URL)
+        mock_client.post.return_value = _response(text="<html>risultati</html>")
+
+        _fetch_html(_query())
+
+        assert mock_client.get.call_args.kwargs["timeout"] == 30
+        assert mock_client.post.call_args.kwargs["timeout"] == 30
+
+
+class TestHttpTimeoutBecomesScraperError:
+
+    def test_primp_timeout_is_covered_by_primp_error(self):
+        """Presupposto di _request(): non serve un except separato per i timeout."""
+        assert issubclass(primp.TimeoutError, primp.PrimpError)
+        assert issubclass(primp.DNSTimeoutError, primp.PrimpError)
+
+    @pytest.mark.parametrize("method", ["get", "post"])
+    @pytest.mark.parametrize("error", [
+        primp.TimeoutError("operation timed out"),
+        primp.DNSTimeoutError("dns timed out"),
+    ], ids=lambda e: type(e).__name__)
+    @patch("scrapers.google_flights._client")
+    def test_request_timeout_raises_scraper_error_with_cause(self, mock_client, method, error):
+        getattr(mock_client, method).side_effect = error
+
+        with pytest.raises(ScraperError) as excinfo:
+            _request(method, "https://example.test/x")
+
+        assert excinfo.value.__cause__ is error
+        assert type(error).__name__ in str(excinfo.value)
+        assert method.upper() in str(excinfo.value)
+
+    @patch("scrapers.google_flights._client")
+    def test_timeout_during_google_flights_get_is_scraper_error_not_empty_list(self, mock_client):
+        error = primp.TimeoutError("operation timed out")
+        mock_client.get.side_effect = error
+
+        with pytest.raises(ScraperError) as excinfo:
+            _fetch_html(_query())
+        assert excinfo.value.__cause__ is error
+
+        # Dentro search_leg: ScraperError, NON [] ("nessun volo").
+        with pytest.raises(ScraperError):
+            search_leg("PSA", "CAG", DEPARTURE)
+
+    @pytest.mark.parametrize("call", [
+        lambda: search_leg("PSA", "CAG", DEPARTURE),
+        lambda: scrape_price("PSA", "CAG", DEPARTURE),
+        lambda: search_options("PSA", "CAG", DEPARTURE),
+        lambda: scrape_price("PSA", "CAG", DEPARTURE, return_date=RETURN),
+        lambda: search_options("PSA", "CAG", DEPARTURE, return_date=RETURN),
+    ], ids=["search_leg", "scrape_price", "search_options",
+            "scrape_price_rt", "search_options_rt"])
+    @patch("scrapers.google_flights._client")
+    def test_get_timeout_is_never_none_or_empty_in_public_functions(self, mock_client, call):
+        mock_client.get.side_effect = primp.TimeoutError("operation timed out")
+
+        with pytest.raises(ScraperError):
+            call()
+
+    @patch("scrapers.google_flights._client")
+    def test_timeout_during_consent_post_is_scraper_error(self, mock_client):
+        error = primp.TimeoutError("operation timed out")
+        mock_client.post.side_effect = error
+
+        with pytest.raises(ScraperError) as excinfo:
+            _submit_consent_form(CONSENT_HTML)
+
+        assert excinfo.value.__cause__ is error
+        assert "POST" in str(excinfo.value)
+
+    @patch("scrapers.google_flights._client")
+    def test_timeout_during_consent_post_is_not_reported_as_no_flights(self, mock_client):
+        """GET ok ma redirect al consenso, POST in timeout: errore, non [] / None."""
+        mock_client.get.return_value = _response(text=CONSENT_HTML, url=CONSENT_URL)
+        mock_client.post.side_effect = primp.TimeoutError("operation timed out")
+
+        with pytest.raises(ScraperError):
+            search_leg("PSA", "CAG", DEPARTURE)
+        with pytest.raises(ScraperError):
+            scrape_price("PSA", "CAG", DEPARTURE)
+        with pytest.raises(ScraperError):
+            search_options("PSA", "CAG", DEPARTURE)
+
+    @patch("scrapers.google_flights._client")
+    def test_no_flights_without_timeout_is_still_empty(self, mock_client):
+        """Controllo di contrasto: stessa catena, nessun timeout -> contratto 'nessun volo' intatto."""
+        mock_client.get.return_value = _response(text=EMPTY_RESULTS_PAGE)
+
+        assert search_leg("PSA", "CAG", DEPARTURE) == []
+        assert scrape_price("PSA", "CAG", DEPARTURE) is None
+        assert search_options("PSA", "CAG", DEPARTURE) == []
+
+
+class TestTimeoutOnSecondRequestOnly:
+    """
+    Round-trip = DUE richieste GET. La prima riesce, la seconda (tratta di
+    ritorno) va in timeout: l'errore non deve diventare None / [] e non deve
+    produrre un prezzo di sola andata.
+    """
+
+    @staticmethod
+    def _one_flight():
+        return SimpleNamespace(
+            price="50.00",
+            airlines=["Ryanair"],
+            flights=[SimpleNamespace(departure=SimpleNamespace(time=(18, 30)))],
+        )
+
+    @pytest.mark.parametrize("call", [
+        lambda: scrape_price("PSA", "CAG", DEPARTURE, return_date=RETURN),
+        lambda: search_options("PSA", "CAG", DEPARTURE, return_date=RETURN),
+    ], ids=["scrape_price", "search_options"])
+    @patch("scrapers.google_flights.parse")
+    @patch("scrapers.google_flights._client")
+    def test_return_leg_timeout_raises_scraper_error(self, mock_client, mock_parse, call):
+        error = primp.TimeoutError("operation timed out")
+        mock_client.get.side_effect = [_response(text="<html>andata</html>"), error]
+        mock_parse.return_value = [self._one_flight()]
+
+        with pytest.raises(ScraperError) as excinfo:
+            call()
+
+        assert excinfo.value.__cause__ is error
+        # Il timeout e' avvenuto davvero sulla seconda richiesta, non sulla prima.
+        assert mock_client.get.call_count == 2
+        assert all(c.kwargs["timeout"] == 30 for c in mock_client.get.call_args_list)

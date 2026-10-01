@@ -54,6 +54,13 @@ from . import ScrapedPrice, FlightOption
 
 GOOGLE_FLIGHTS_URL = "https://www.google.com/travel/flights"
 
+# Limite di tempo per OGNI richiesta HTTP (GET dei risultati, POST del consenso).
+# primp lo applica all'intera richiesta, corpo della risposta compreso; allo
+# scadere solleva primp.TimeoutError, che _request() converte in ScraperError.
+# Senza questo limite una richiesta rimasta appesa bloccherebbe senza fine il
+# chiamante (bot o scheduler).
+HTTP_TIMEOUT_SECONDS = 30
+
 # Un solo client, riusato tra le chiamate: dopo il primo superamento del muro
 # di consenso, il cookie ottenuto resta valido per tutte le richieste
 # successive nello stesso processo (cookie_store=True), evitando di rifare
@@ -84,9 +91,10 @@ def _request(method: str, url: str, **kwargs):
     DNS...) o una risposta HTTP 4xx/5xx solleva ScraperError e non arriva mai
     al parser: primp, di suo, restituisce le risposte 429/503 come se fossero
     normali, quindi lo status va controllato esplicitamente.
+    Ogni richiesta ha un limite di HTTP_TIMEOUT_SECONDS secondi.
     """
     try:
-        response = getattr(_client, method)(url, **kwargs)
+        response = getattr(_client, method)(url, timeout=HTTP_TIMEOUT_SECONDS, **kwargs)
     except PrimpError as exc:
         raise ScraperError(
             f"Richiesta {method.upper()} a Google fallita ({type(exc).__name__})"
