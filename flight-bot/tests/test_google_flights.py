@@ -21,6 +21,7 @@ from scrapers.google_flights import (
     _submit_consent_form,
     _fetch_html,
     LegOption,
+    HTTP_TIMEOUT_SECONDS,
 )
 from scrapers import ScrapedPrice, FlightOption
 from fast_flights.exceptions import FlightsNotFound
@@ -929,7 +930,7 @@ class TestSubmitConsentFormRealParsing:
         # Dati del form "Accetta" (non quelli del form "Rifiuta"): hidden +
         # altri input con name; l'input senza name e' escluso, il value
         # mancante diventa stringa vuota.
-        assert kwargs == {"data": {
+        assert kwargs == {"timeout": HTTP_TIMEOUT_SECONDS, "data": {
             "gl": "IT",
             "m": "0",
             "continue": "https://www.google.com/travel/flights?hl=it",
