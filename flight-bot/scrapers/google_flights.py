@@ -76,12 +76,14 @@ _client = Client(
 class ScraperError(RuntimeError):
     """
     Errore TECNICO durante il recupero o l'analisi di una pagina Google Flights
-    (rete, risposta HTTP 4xx/5xx, consenso, pagina non interpretabile).
+    (rete, risposta HTTP 4xx/5xx, consenso, pagina non interpretabile, risposta
+    di errore di Google segnalata da fast-flights con FlightsNotFound).
 
-    NON significa "nessun volo trovato": quel caso resta [] / None secondo il
-    contratto di search_leg / scrape_price / search_options. Estende
-    RuntimeError perche' il codice di consenso sollevava gia' RuntimeError.
-    L'eccezione originale e' sempre disponibile in `__cause__`.
+    NON significa "nessun volo trovato": una risposta VALIDA senza voli resta
+    [] / None secondo il contratto di search_leg / scrape_price /
+    search_options. Estende RuntimeError perche' il codice di consenso
+    sollevava gia' RuntimeError. L'eccezione originale e' sempre disponibile
+    in `__cause__`.
     """
 
 
@@ -203,19 +205,25 @@ def search_leg(origin: str, destination: str, date: datetime,
     (che prende solo la più economica) sia search_options() per /cerca (che
     ne mostra diverse per costruire le combinazioni andata×ritorno).
 
-    Nessun volo -> []. Errore tecnico (rete, HTTP, consenso, parsing) ->
-    ScraperError: i due casi non vanno mai confusi.
+    Risposta valida senza voli -> []. Errore tecnico (rete, HTTP, consenso,
+    parsing, risposta di errore di Google = FlightsNotFound) -> ScraperError:
+    i due casi non vanno mai confusi.
     """
     query = _build_one_way_query(origin, destination, date, earliest_hour, latest_hour)
 
     try:
         html = _fetch_html(query)
         result = parse(html)
-    except FlightsNotFound:
-        # Contratto invariato: per fast-flights e' "nessun volo" (il suo parse()
-        # la solleva su un payload di errore di Google). Non verificato con
-        # dati reali se questo payload possa anche indicare un errore transitorio.
-        return []
+    except FlightsNotFound as exc:
+        # fast-flights solleva FlightsNotFound quando Google risponde con un
+        # payload di errore ("errorHasStatus: true"), NON quando la ricerca e'
+        # valida ma senza voli: in quel caso parse() restituisce una lista
+        # vuota. Quindi qui e' un errore tecnico, mai un [] silenzioso. Non
+        # distinguiamo (ancora) rate limit, anti-bot, query invalida ecc.
+        raise ScraperError(
+            "Google Flights ha risposto con un errore (FlightsNotFound / "
+            f"errorHasStatus: {exc}); non e' una risposta valida senza voli"
+        ) from exc
     except ScraperError:
         raise
     except Exception as exc:
@@ -254,8 +262,10 @@ def scrape_price(origin: str, destination: str, departure_date: datetime,
     al file) e il prezzo totale è la somma delle due tariffe più economiche
     che rispettano i filtri richiesti.
 
-    None = nessun risultato. Un errore tecnico solleva ScraperError (vedi
-    search_leg): non viene mai convertito in None.
+    None = risposta valida senza risultati. Un errore tecnico (compresa una
+    risposta di errore di Google, FlightsNotFound) solleva ScraperError su
+    qualunque tratta, andata o ritorno: non viene mai convertito in None ne'
+    in un prezzo parziale (vedi search_leg).
     """
     andata = search_leg(origin, destination, departure_date,
                          earliest_departure_hour, latest_departure_hour, direct_only)
@@ -303,8 +313,10 @@ def search_options(origin: str, destination: str, departure_date: datetime,
     anche una combinazione che non è la più conveniente in assoluto, se ti fa
     comodo un orario diverso.
 
-    [] = nessuna opzione. Un errore tecnico solleva ScraperError (vedi
-    search_leg): non viene mai convertito in [].
+    [] = risposta valida senza opzioni. Un errore tecnico (compresa una
+    risposta di errore di Google, FlightsNotFound) solleva ScraperError su
+    qualunque tratta, andata o ritorno: non viene mai convertito in [] (vedi
+    search_leg).
     """
     andata = search_leg(origin, destination, departure_date, direct_only=True,
                          max_results=max_per_leg)

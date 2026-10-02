@@ -26,6 +26,7 @@ from scrapers.google_flights import (
     HTTP_TIMEOUT_SECONDS,
     ScraperError,
     LegOption,
+    parse as real_parse,
     _fetch_html,
     _request,
     _submit_consent_form,
@@ -89,6 +90,12 @@ _empty_payload = [None] * 8
 _empty_payload[3] = [None]
 _empty_payload[7] = [None, [[], []]]
 EMPTY_RESULTS_PAGE = _ds1_page(json.dumps(_empty_payload))
+
+# Altra forma di risposta valida senza itinerari: lista vuota invece di None.
+_empty_list_payload = [None] * 8
+_empty_list_payload[3] = [[]]
+_empty_list_payload[7] = [None, [[], []]]
+EMPTY_LIST_RESULTS_PAGE = _ds1_page(json.dumps(_empty_list_payload))
 
 # Pagina che non e' quella dei risultati (captcha, blocco, errore Google...).
 UNUSABLE_PAGE = "<html><body>Il nostro sistema ha rilevato traffico insolito</body></html>"
@@ -260,21 +267,32 @@ class TestParserFailures:
 # ------------------------------------ 5. nessun volo vs errore tecnico -------
 
 class TestNoFlightsIsNotAnError:
-    """Il caso "nessun volo" mantiene il contratto pubblico esistente."""
+    """
+    Una risposta VALIDA senza voli resta [] (contratto pubblico invariato).
+    Una risposta di errore di Google (FlightsNotFound / errorHasStatus) NON e'
+    "nessun volo": e' un ScraperError (vedi anche TestFlightsNotFoundIsScraperError).
+    """
 
     @patch("scrapers.google_flights.parse")
     @patch("scrapers.google_flights._fetch_html")
-    def test_flights_not_found_still_means_no_flights(self, mock_fetch, mock_parse):
+    def test_flights_not_found_is_scraper_error_not_no_flights(self, mock_fetch, mock_parse):
+        original = FlightsNotFound("no flights found")
         mock_fetch.return_value = "<html></html>"
-        mock_parse.side_effect = FlightsNotFound("no flights found")
+        mock_parse.side_effect = original
 
-        assert search_leg("PSA", "CAG", DEPARTURE) == []
+        with pytest.raises(ScraperError) as excinfo:
+            search_leg("PSA", "CAG", DEPARTURE)
+
+        assert excinfo.value.__cause__ is original
 
     @patch("scrapers.google_flights._fetch_html")
-    def test_real_parser_google_error_payload_is_no_flights(self, mock_fetch):
+    def test_real_parser_google_error_payload_is_scraper_error(self, mock_fetch):
         mock_fetch.return_value = GOOGLE_ERROR_PAYLOAD_PAGE
 
-        assert search_leg("PSA", "CAG", DEPARTURE) == []
+        with pytest.raises(ScraperError) as excinfo:
+            search_leg("PSA", "CAG", DEPARTURE)
+
+        assert isinstance(excinfo.value.__cause__, FlightsNotFound)
 
     @patch("scrapers.google_flights._fetch_html")
     def test_real_parser_empty_results_is_no_flights(self, mock_fetch):
@@ -366,10 +384,13 @@ class TestEndToEndOnlyNetworkMocked:
             scrape_price("PSA", "CAG", DEPARTURE)
 
     @patch("scrapers.google_flights._client")
-    def test_http_200_google_error_payload_is_none(self, mock_client):
+    def test_http_200_google_error_payload_is_scraper_error_not_none(self, mock_client):
         mock_client.get.return_value = _response(text=GOOGLE_ERROR_PAYLOAD_PAGE)
 
-        assert scrape_price("PSA", "CAG", DEPARTURE) is None
+        with pytest.raises(ScraperError) as excinfo:
+            scrape_price("PSA", "CAG", DEPARTURE)
+
+        assert isinstance(excinfo.value.__cause__, FlightsNotFound)
 
     @patch("scrapers.google_flights._client")
     def test_http_200_empty_results_is_none_and_empty_list(self, mock_client):
@@ -568,3 +589,171 @@ class TestTimeoutOnSecondRequestOnly:
         # Il timeout e' avvenuto davvero sulla seconda richiesta, non sulla prima.
         assert mock_client.get.call_count == 2
         assert all(c.kwargs["timeout"] == 30 for c in mock_client.get.call_args_list)
+
+
+# ------------------------------------------- FlightsNotFound = errore tecnico ---
+
+OUTBOUND_HTML = "<html>andata</html>"
+
+
+def _valid_flight(price=50):
+    """Itinerario valido nella forma che search_leg legge da parse()."""
+    return SimpleNamespace(
+        price=f"{price:.2f}",
+        airlines=["Ryanair"],
+        flights=[SimpleNamespace(departure=SimpleNamespace(time=(18, 30)))],
+    )
+
+
+def _public_call(function, round_trip):
+    if function == "scrape_price":
+        fn = scrape_price
+    else:
+        fn = search_options
+    if round_trip:
+        return lambda: fn("PSA", "CAG", DEPARTURE, return_date=RETURN)
+    return lambda: fn("PSA", "CAG", DEPARTURE)
+
+
+class TestFlightsNotFoundIsScraperError:
+    """
+    fast-flights solleva FlightsNotFound solo su un payload di errore di Google
+    (errorHasStatus: true); una risposta valida senza voli e' una lista vuota.
+    Qui FlightsNotFound = errore tecnico: ScraperError con causa originale e
+    mai un [] / None / prezzo parziale.
+    """
+
+    @patch("scrapers.google_flights.parse")
+    @patch("scrapers.google_flights._fetch_html")
+    def test_search_leg_error_has_cause_and_useful_message(self, mock_fetch, mock_parse):
+        original = FlightsNotFound("no flights found; received error")
+        mock_fetch.return_value = "<html></html>"
+        mock_parse.side_effect = original
+
+        with pytest.raises(ScraperError) as excinfo:
+            search_leg("PSA", "CAG", DEPARTURE)
+
+        assert excinfo.value.__cause__ is original
+        assert "FlightsNotFound" in str(excinfo.value)
+        assert "errorHasStatus" in str(excinfo.value)
+        # RuntimeError: compatibile con chi gia' catturava gli errori tecnici.
+        assert isinstance(excinfo.value, RuntimeError)
+
+    # ---- A / B / E: tratta di andata e di ritorno, funzioni pubbliche ----
+    @pytest.mark.parametrize("function", ["scrape_price", "search_options"])
+    @pytest.mark.parametrize("round_trip", [False, True], ids=["one_way", "round_trip"])
+    @patch("scrapers.google_flights.parse")
+    @patch("scrapers.google_flights._fetch_html")
+    def test_outbound_flights_not_found_raises_scraper_error(
+            self, mock_fetch, mock_parse, function, round_trip):
+        original = FlightsNotFound("no flights found; received error")
+        mock_fetch.return_value = "<html></html>"
+        mock_parse.side_effect = [original]          # la PRIMA ricerca (andata) fallisce
+
+        with pytest.raises(ScraperError) as excinfo:
+            _public_call(function, round_trip)()
+
+        assert excinfo.value.__cause__ is original
+
+    @pytest.mark.parametrize("function", ["scrape_price", "search_options"])
+    @patch("scrapers.google_flights.parse")
+    @patch("scrapers.google_flights._fetch_html")
+    def test_return_flights_not_found_raises_scraper_error_without_partial_result(
+            self, mock_fetch, mock_parse, function):
+        original = FlightsNotFound("no flights found; received error")
+        mock_fetch.return_value = "<html></html>"
+        # andata OK, ritorno in errore: nessun prezzo/opzione parziale, solo eccezione.
+        mock_parse.side_effect = [[_valid_flight()], original]
+
+        with pytest.raises(ScraperError) as excinfo:
+            _public_call(function, True)()
+
+        assert excinfo.value.__cause__ is original
+        assert mock_parse.call_count == 2            # il ritorno e' stato davvero cercato
+
+    # ---- A / B / E con il parser REALE (si mocka solo la rete) ----
+    @pytest.mark.parametrize("function", ["scrape_price", "search_options"])
+    @pytest.mark.parametrize("failing_leg", ["outbound", "return"])
+    @patch("scrapers.google_flights.parse")
+    @patch("scrapers.google_flights._client")
+    def test_real_parser_error_page_on_one_leg_raises_scraper_error(
+            self, mock_client, mock_parse, function, failing_leg):
+        mock_parse.side_effect = (
+            lambda html: [_valid_flight()] if html == OUTBOUND_HTML else real_parse(html))
+        if failing_leg == "outbound":
+            pages = [_response(text=GOOGLE_ERROR_PAYLOAD_PAGE)]
+        else:
+            pages = [_response(text=OUTBOUND_HTML), _response(text=GOOGLE_ERROR_PAYLOAD_PAGE)]
+        mock_client.get.side_effect = pages
+
+        with pytest.raises(ScraperError) as excinfo:
+            _public_call(function, True)()
+
+        assert isinstance(excinfo.value.__cause__, FlightsNotFound)
+        assert mock_client.get.call_count == len(pages)
+
+    # ---- C: una risposta valida senza voli resta [] / None ----
+    @pytest.mark.parametrize("page", [EMPTY_RESULTS_PAGE, EMPTY_LIST_RESULTS_PAGE],
+                             ids=["payload3_none", "payload3_empty_list"])
+    @patch("scrapers.google_flights._fetch_html")
+    def test_valid_empty_response_is_empty_list_unlike_error_response(self, mock_fetch, page):
+        mock_fetch.return_value = page
+        assert search_leg("PSA", "CAG", DEPARTURE) == []
+
+        mock_fetch.return_value = GOOGLE_ERROR_PAYLOAD_PAGE      # stessa funzione, risposta di errore
+        with pytest.raises(ScraperError):
+            search_leg("PSA", "CAG", DEPARTURE)
+
+    @patch("scrapers.google_flights.parse")
+    @patch("scrapers.google_flights._client")
+    def test_valid_empty_return_leg_is_none_and_empty_list(self, mock_client, mock_parse):
+        """Contrasto con il test precedente: ritorno VALIDO ma senza voli -> None / [] (non errore)."""
+        mock_parse.side_effect = (
+            lambda html: [_valid_flight()] if html == OUTBOUND_HTML else real_parse(html))
+        # 4 GET: scrape_price (andata, ritorno) poi search_options (andata, ritorno).
+        mock_client.get.side_effect = [
+            _response(text=OUTBOUND_HTML), _response(text=EMPTY_RESULTS_PAGE),
+            _response(text=OUTBOUND_HTML), _response(text=EMPTY_RESULTS_PAGE),
+        ]
+
+        assert scrape_price("PSA", "CAG", DEPARTURE, return_date=RETURN) is None
+        assert search_options("PSA", "CAG", DEPARTURE, return_date=RETURN) == []
+
+
+class TestScraperErrorFromFlightsNotFoundPropagates:
+    """
+    D / E: se search_leg solleva ScraperError (causa FlightsNotFound), le
+    funzioni pubbliche lo propagano IDENTICO: niente [] / None, niente messaggio
+    riscritto, niente causa persa.
+    """
+
+    @staticmethod
+    def _router(failing_origin, error):
+        def fake(origin, destination, date, *args, **kwargs):
+            if origin == failing_origin:
+                raise error
+            return [LegOption(price_eur=50.0, time="18:30", airlines=["Ryanair"], stops=0)]
+        return fake
+
+    @staticmethod
+    def _error():
+        original = FlightsNotFound("no flights found; received error")
+        error = ScraperError("risposta di errore")
+        error.__cause__ = original
+        return error, original
+
+    @pytest.mark.parametrize("function", ["scrape_price", "search_options"])
+    @pytest.mark.parametrize("failing_origin,round_trip", [
+        ("PSA", False), ("PSA", True), ("CAG", True),
+    ], ids=["one_way_outbound", "round_trip_outbound", "round_trip_return"])
+    @patch("scrapers.google_flights.search_leg")
+    def test_scraper_error_is_propagated_unchanged(
+            self, mock_leg, function, failing_origin, round_trip):
+        error, original = self._error()
+        mock_leg.side_effect = self._router(failing_origin, error)
+
+        with pytest.raises(ScraperError) as excinfo:
+            _public_call(function, round_trip)()
+
+        assert excinfo.value is error
+        assert excinfo.value.__cause__ is original
