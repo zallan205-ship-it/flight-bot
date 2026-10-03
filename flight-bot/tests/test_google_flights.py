@@ -22,6 +22,7 @@ from scrapers.google_flights import (
     _fetch_html,
     LegOption,
     HTTP_TIMEOUT_SECONDS,
+    ScraperError,
 )
 from scrapers import ScrapedPrice, FlightOption
 from fast_flights.exceptions import FlightsNotFound
@@ -758,15 +759,16 @@ class TestFlightsNotFound:
     
     @patch("scrapers.google_flights._fetch_html")
     @patch("scrapers.google_flights.parse")
-    def test_search_leg_flights_not_found_returns_empty_list(self, mock_parse, mock_fetch_html):
-        """FlightsNotFound da parse() -> lista vuota instead of exception"""
+    def test_search_leg_flights_not_found_raises_scraper_error(self, mock_parse, mock_fetch_html):
+        """FlightsNotFound da parse() (errorHasStatus di Google) -> ScraperError, NON []"""
         mock_fetch_html.return_value = "<html></html>"
-        mock_parse.side_effect = FlightsNotFound()
-        
-        result = search_leg("PSA", "CAG", datetime(2026, 12, 25))
-        
-        assert result == []
-        assert isinstance(result, list)
+        original = FlightsNotFound("no flights found; received error")
+        mock_parse.side_effect = original
+
+        with pytest.raises(ScraperError) as excinfo:
+            search_leg("PSA", "CAG", datetime(2026, 12, 25))
+
+        assert excinfo.value.__cause__ is original
 
 
 class TestSubmitConsentForm:
