@@ -14,6 +14,7 @@ Comandi Telegram per la gestione dei monitoraggi.
   /elenco
       Elenca i monitoraggi manuali attivi, con la loro chiave.
 """
+import logging
 import re
 from datetime import datetime
 
@@ -24,7 +25,9 @@ from config import TELEGRAM_BOT_TOKEN, TOPIC_MANUAL, SEARCH_MAX_OPTIONS, SEARCH_
 from db import SessionLocal
 from models import MonitoredSearch, MonitorType, build_flight_key
 from calibration import _find_red_period
-from scrapers.google_flights import search_options
+from scrapers.google_flights import search_options, ScraperError
+
+logger = logging.getLogger("flight_bot.bot")
 
 FLIGHT_KEY_PATTERN = re.compile(r"^[A-Z]{6}\d{4}$")  # es. PSACAG0491
 
@@ -179,6 +182,19 @@ async def cerca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         opzioni = search_options(origin, destination, departure, return_date,
                                   max_results=SEARCH_MAX_OPTIONS)
+    except ScraperError:
+        # Errore tecnico dello scraper (rete, HTTP, consenso, parsing, risposta di
+        # errore di Google): NON e' "nessun volo". Il dettaglio tecnico (traceback
+        # con causa originale) resta nei log; all'utente va solo un messaggio
+        # generico, senza nomi di eccezioni ne' dettagli interni.
+        logger.exception(
+            "/cerca: errore tecnico dello scraper (%s -> %s, partenza %s, ritorno %s)",
+            origin, destination, departure, return_date,
+        )
+        await update.message.reply_text(
+            "Non sono riuscito a recuperare i voli in questo momento. Riprova più tardi."
+        )
+        return
     except Exception as e:
         await update.message.reply_text(f"Errore durante la ricerca: {e}")
         return
