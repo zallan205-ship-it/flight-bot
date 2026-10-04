@@ -26,7 +26,7 @@ from config import (
 )
 from db import SessionLocal
 from models import MonitoredSearch, PriceSnapshot, MonitorType, build_flight_key
-from scrapers.google_flights import scrape_price as scrape_google
+from scrapers.google_flights import scrape_price as scrape_google, ScraperError
 from alerts import maybe_send_alert
 from calibration import recalibrate, _find_red_period
 
@@ -120,6 +120,18 @@ async def run_scraping_cycle():
                     latest_return_hour=latest_return_hour,
                     direct_only=direct_only,
                 )
+            except ScraperError:
+                # Errore tecnico dello scraper (rete, HTTP, consenso, parsing,
+                # risposta di errore di Google): NON e' "nessun volo". Si salta
+                # solo QUESTA ricerca, con il dettaglio completo nei log
+                # (traceback con causa originale): nessuno snapshot, nessun alert.
+                logger.exception(
+                    "Errore tecnico dello scraper per search_id=%s (%s, %s -> %s, "
+                    "partenza %s, ritorno %s)",
+                    search.id, search.flight_key, search.origin, search.destination,
+                    search.departure_date, search.return_date,
+                )
+                continue
             except Exception:
                 logger.exception("Scraping fallito per search_id=%s", search.id)
                 continue
