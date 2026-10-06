@@ -1,9 +1,51 @@
 """
 Pytest configuration e fixture globali per la suite di test dello scraper Google Flights.
 """
+import asyncio
+import sys
+import time
+
 import pytest
 from unittest.mock import Mock, MagicMock, patch
 from datetime import datetime
+
+
+@pytest.fixture(autouse=True)
+def _no_real_waits(monkeypatch):
+    """
+    Nessun test deve ATTENDERE davvero: un'attesa reale > 0 (asyncio.sleep / time.sleep)
+    fa fallire subito il test invece di rallentare la suite di minuti. asyncio.sleep(0)
+    (cessione del controllo all'event loop) resta consentito.
+    """
+    real_async_sleep = asyncio.sleep
+
+    async def guarded_async_sleep(delay, *args, **kwargs):
+        if delay and delay > 0:
+            raise AssertionError(f"attesa reale asyncio.sleep({delay}) nei test")
+        return await real_async_sleep(delay, *args, **kwargs)
+
+    def guarded_time_sleep(delay):
+        raise AssertionError(f"attesa reale time.sleep({delay}) nei test")
+
+    monkeypatch.setattr(asyncio, "sleep", guarded_async_sleep)
+    monkeypatch.setattr(time, "sleep", guarded_time_sleep)
+
+
+@pytest.fixture(autouse=True)
+def _reset_scheduler_failure_state():
+    """
+    Lo stato dei fallimenti consecutivi dello scheduler e' a livello di modulo (in memoria):
+    senza reset filtrerebbe da un test all'altro e farebbe scattare l'alert amministrativo
+    "a caso". Import pigro: scheduler richiede variabili d'ambiente solo i test che lo
+    importano le impostano.
+    """
+    def _clear():
+        module = sys.modules.get("scheduler")
+        if module is not None:
+            module._consecutive_failures.clear()
+    _clear()
+    yield
+    _clear()
 
 
 @pytest.fixture

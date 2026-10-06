@@ -13,16 +13,19 @@ Scheduler principale (APScheduler). Tre job:
    interroga entrambi gli scraper, salva gli snapshot, valuta gli alert.
 3. weekly_recalibration (settimanale): richiama calibration.recalibrate.
 """
+import asyncio
 import logging
+import random
 from datetime import datetime, timedelta
 
+import primp
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot
 
 from config import (
     AUTO_ROUTES, WEEKEND_DEPARTURE_WEEKDAY, WEEKEND_DEPARTURE_MIN_HOUR,
     WEEKEND_RETURN_WEEKDAY, WEEKEND_RETURN_MIN_HOUR, WEEKENDS_HORIZON_TO_TRACK,
-    SCRAPE_INTERVAL_MINUTES_AUTO, TELEGRAM_BOT_TOKEN,
+    SCRAPE_INTERVAL_MINUTES_AUTO, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
 )
 from db import SessionLocal
 from models import MonitoredSearch, PriceSnapshot, MonitorType, build_flight_key
@@ -31,6 +34,116 @@ from alerts import maybe_send_alert
 from calibration import recalibrate, _find_red_period
 
 logger = logging.getLogger("flight_bot.scheduler")
+
+# --- Retry degli errori tecnici TEMPORANEI dello scraper ----------------------------
+# La decisione "questo errore va ritentato?" e' una policy applicativa: sta qui, non
+# nello scraper (che si limita a sollevare ScraperError).
+
+# Attesa prima del 2° e del 3° tentativo: al massimo 2 retry dopo il tentativo iniziale.
+SCRAPE_RETRY_BASE_DELAYS_SECONDS = (60, 180)
+SCRAPE_RETRY_MAX_DELAY_SECONDS = 180     # tetto, jitter compreso
+SCRAPE_RETRY_JITTER = 0.20               # ±20% sull'attesa base
+
+# Alert amministrativo al N-esimo fallimento DEFINITIVO consecutivo della stessa ricerca.
+ADMIN_ALERT_FAILURE_THRESHOLD = 3
+
+# Fallimenti definitivi consecutivi per ricerca (chiave: MonitoredSearch.id). Solo in
+# memoria, per scelta: si azzera al riavvio del processo. Nessuna persistenza su DB.
+_consecutive_failures: dict[int, int] = {}
+
+
+def _is_retryable(error: ScraperError) -> bool:
+    """
+    True solo per errori tecnici verosimilmente TEMPORANEI: timeout, HTTP 429, HTTP 5xx.
+    Tutto il resto NON si ritenta: HTTP 403 e altri 4xx, FlightsNotFound (risposta di
+    errore di Google), errori del parser, errori strutturali del consenso, errori di
+    connessione/DNS non di timeout, cause sconosciute.
+
+    La classificazione guarda il TIPO della causa originale (`__cause__`), mai il testo
+    del messaggio. Lo status HTTP e' `args[0]` di primp.StatusError (int): layout
+    osservato con primp 2.0.1, non documentato. Se non e' un int NON si ritenta
+    (scelta prudente) e lo si segnala nei log.
+    """
+    cause = error.__cause__
+    if isinstance(cause, primp.TimeoutError):      # include DNSTimeoutError
+        return True
+    if isinstance(cause, primp.StatusError):
+        status = cause.args[0] if cause.args else None
+        if not isinstance(status, int):
+            logger.warning("primp.StatusError senza status HTTP leggibile (args=%r): "
+                           "nessun retry", cause.args)
+            return False
+        return status == 429 or 500 <= status <= 599
+    return False
+
+
+def _retry_delay(retry_index: int) -> float:
+    """Attesa (secondi) prima del retry `retry_index` (0 = primo): base ±jitter, con tetto."""
+    base = SCRAPE_RETRY_BASE_DELAYS_SECONDS[retry_index]
+    jittered = base * random.uniform(1 - SCRAPE_RETRY_JITTER, 1 + SCRAPE_RETRY_JITTER)
+    return min(SCRAPE_RETRY_MAX_DELAY_SECONDS, jittered)
+
+
+async def _sleep(seconds: float) -> None:
+    """Attesa NON bloccante (cede l'event loop al bot). Punto unico da mockare nei test."""
+    await asyncio.sleep(seconds)
+
+
+async def _scrape_with_retry(search: MonitoredSearch, **scrape_kwargs):
+    """
+    Esegue lo scraping di UNA ricerca: tentativo iniziale piu' al massimo
+    len(SCRAPE_RETRY_BASE_DELAYS_SECONDS) retry, solo per errori ritentabili.
+    Con un errore non ritentabile, o esauriti i retry, rilancia l'ultimo ScraperError.
+    Un risultato valido (anche "nessun volo" = None) ritorna subito: nessun retry.
+    """
+    max_retries = len(SCRAPE_RETRY_BASE_DELAYS_SECONDS)
+    retries_done = 0
+    while True:
+        try:
+            return scrape_google(search.origin, search.destination,
+                                 search.departure_date, search.return_date, **scrape_kwargs)
+        except ScraperError as error:
+            if retries_done >= max_retries or not _is_retryable(error):
+                raise
+            delay = _retry_delay(retries_done)
+            retries_done += 1
+            logger.warning(
+                "Errore tecnico temporaneo per search_id=%s (%s); retry %d/%d tra %.0fs",
+                search.id, error, retries_done, max_retries, delay,
+            )
+            await _sleep(delay)
+
+
+def _record_failure(search_id: int) -> int:
+    """Registra un fallimento DEFINITIVO della ricerca; ritorna il conteggio consecutivo."""
+    _consecutive_failures[search_id] = _consecutive_failures.get(search_id, 0) + 1
+    return _consecutive_failures[search_id]
+
+
+def _record_success(search_id: int) -> None:
+    """La ricerca e' tornata a rispondere (anche con 'nessun volo'): azzera il conteggio."""
+    _consecutive_failures.pop(search_id, None)
+
+
+async def _send_admin_alert(bot: Bot, search: MonitoredSearch, failures: int) -> None:
+    """
+    Alert amministrativo (best effort): solo contesto della ricerca, NESSUN dettaglio
+    tecnico (quelli restano nei log). Un errore nell'invio non deve interrompere il ciclo.
+    """
+    dates = search.departure_date.strftime("%d/%m/%Y")
+    if search.return_date:
+        dates += " - " + search.return_date.strftime("%d/%m/%Y")
+    text = (
+        "⚠️ Scraper Google Flights\n\n"
+        f"{failures} controlli consecutivi falliti per la ricerca "
+        f"{search.origin} → {search.destination} ({dates}).\n\n"
+        "Il monitoraggio continua automaticamente."
+    )
+    try:
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID,
+                               message_thread_id=search.telegram_topic_id, text=text)
+    except Exception:
+        logger.exception("Invio dell'alert amministrativo fallito per search_id=%s", search.id)
 
 
 def _next_weekend_dates(n_weekends: int) -> list[tuple[datetime, datetime]]:
@@ -111,9 +224,8 @@ async def run_scraping_cycle():
                 direct_only = False
 
             try:
-                result = scrape_google(
-                    search.origin, search.destination,
-                    search.departure_date, search.return_date,
+                result = await _scrape_with_retry(
+                    search,
                     earliest_departure_hour=earliest_departure_hour,
                     latest_departure_hour=latest_departure_hour,
                     earliest_return_hour=earliest_return_hour,
@@ -131,10 +243,16 @@ async def run_scraping_cycle():
                     search.id, search.flight_key, search.origin, search.destination,
                     search.departure_date, search.return_date,
                 )
+                # Fallimento DEFINITIVO (retry gia' esauriti o errore non ritentabile).
+                failures = _record_failure(search.id)
+                if failures == ADMIN_ALERT_FAILURE_THRESHOLD:   # una sola volta per serie
+                    await _send_admin_alert(bot, search, failures)
                 continue
             except Exception:
                 logger.exception("Scraping fallito per search_id=%s", search.id)
                 continue
+
+            _record_success(search.id)   # risposta valida (anche "nessun volo"): azzera la serie
 
             if result is None:
                 # Volo non ancora "rilasciato" dalla compagnia, o nessun risultato
