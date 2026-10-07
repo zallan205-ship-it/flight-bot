@@ -1,21 +1,28 @@
 """
-Test della retry policy dello scheduler (scheduler.py), del tracking dei fallimenti
-consecutivi per ricerca e dell'alert amministrativo.
+Test della retry policy dello scheduler, del tracking dei fallimenti e dell'alert
+amministrativo AGGREGATO.
 
-Policy sotto test (livello APPLICATIVO: lo scraper non ritenta mai):
+Architettura sotto test (scheduler.py; lo scraper non ritenta mai):
 
-    RETRY    : timeout, HTTP 429, HTTP 5xx
-    NO RETRY : HTTP 403 (e altri 4xx), FlightsNotFound, errori del parser,
-               errori strutturali del consenso, errori di connessione/DNS non di
-               timeout, cause sconosciute
-    massimo 2 retry (3 tentativi), attese ~60 s e ~180 s con jitter ±20% e tetto 180 s
-    un "fallimento" = fallimento DEFINITIVO di una ricerca in un ciclo (dopo i retry)
-    alert amministrativo al 3° fallimento consecutivo della STESSA ricerca (una sola volta)
+    ciclo = primo passaggio su TUTTE le ricerche
+            -> al massimo 2 passaggi di retry sulle SOLE ricerche fallite con un errore
+               temporaneo (timeout, HTTP 429, HTTP 5xx), ciascuno dopo UNA sola attesa
+               (~60 s poi ~180 s, jitter ±20%, tetto 180 s)
+            -> le ricerche ancora in errore hanno un fallimento DEFINITIVO (+1)
 
-Tutto offline: scraper/rete, DB, Bot, alert di prezzo e attese sono mockati. Nessun
-sleep reale: un'attesa reale > 0 fa fallire il test (fixture autouse in conftest.py).
+    contatore per ricerca : fallimenti definitivi consecutivi (retry non contati);
+                            si azzera con qualsiasi risposta valida, anche "nessun volo"
+    alert amministrativo  : UNO per ciclo, aggregato, quando almeno una ricerca ha
+                            raggiunto 3 fallimenti consecutivi; una sola volta finche'
+                            nessuna ricerca e' piu' in errore persistente
+
+Tutto offline: scraper/rete, Bot, alert di prezzo e attese sono mockati (il DB e' mockato
+tranne nei test "ORM vero", che usano SQLite su file temporaneo). Nessuna attesa reale:
+la fixture autouse in conftest.py fa fallire il test se si attende davvero.
 """
 import asyncio
+import collections
+import inspect
 import logging
 import os
 import random
@@ -26,6 +33,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import primp
 import pytest
 from fast_flights.exceptions import FlightsNotFound
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 # config.py legge queste variabili all'IMPORT: valori finti, mai credenziali reali.
 for _name, _value in {
@@ -39,10 +48,9 @@ for _name, _value in {
     os.environ[_name] = _value
 
 import scheduler  # noqa: E402
+from models import Base, MonitoredSearch, MonitorType, PriceSnapshot  # noqa: E402
 from scrapers import ScrapedPrice  # noqa: E402
-from scrapers.google_flights import (  # noqa: E402
-    ScraperError, _submit_consent_form, search_leg,
-)
+from scrapers.google_flights import ScraperError, search_leg  # noqa: E402
 
 DEPARTURE = datetime(2026, 12, 25)
 CONSENT_URL = "https://consent.google.com/m?continue=https://www.google.com/travel/flights"
@@ -52,27 +60,59 @@ GOOGLE_ERROR_PAGE = (
     "</script></body></html>"
 )
 UNUSABLE_PAGE = "<html><body>traffico insolito rilevato</body></html>"
+TECH_SECRET = "SECRET-TECH-DETAIL-98765"
 
 
-# ------------------------------------------------------------- costruzione errori ----
+# ---------------------------------------------------------------- errori e prezzi ----
 
-def _scraper_error(message, cause=None):
-    """ScraperError sollevata `from cause`, come fa lo scraper (cause=None: nessuna causa)."""
+def _error(message="errore tecnico", *, status=None, timed_out=False, cause=None):
+    """ScraperError sollevata `from cause` come fa lo scraper, con gli attributi strutturati."""
     try:
         if cause is None:
-            raise ScraperError(message)
+            raise ScraperError(message, status_code=status, timed_out=timed_out)
         try:
             raise cause
         except Exception as exc:
-            raise ScraperError(message) from exc
+            raise ScraperError(message, status_code=status, timed_out=timed_out) from exc
     except ScraperError as err:
         return err
 
 
+def _timeout():
+    return _error("Richiesta GET a Google fallita (TimeoutError)", timed_out=True,
+                  cause=primp.TimeoutError("operation timed out"))
+
+
 def _status_error(status):
-    """primp.StatusError con il layout REALE osservato: args = (status:int, messaggio, url)."""
     url = "https://example.test/x"
     return primp.StatusError(status, f"HTTP {status} for URL: {url}", url)
+
+
+def _http(status):
+    return _error(f"Google ha risposto con errore HTTP {status} alla richiesta GET",
+                  status=status, cause=_status_error(status))
+
+
+def _flights_not_found():
+    return _error("Google Flights ha risposto con un errore (FlightsNotFound / errorHasStatus)",
+                  cause=FlightsNotFound("no flights found; received error"))
+
+
+def _parser_error():
+    return _error("Analisi della pagina Google Flights fallita (AttributeError)",
+                  cause=AttributeError("'NoneType' object has no attribute 'text'"))
+
+
+def _consent_structure_error():
+    return _error("Pagina di consenso Google senza nessun <form>")
+
+
+def _price(value):
+    return ScrapedPrice(
+        price_eur=value, origin="PSA", destination="CAG",
+        departure_date=DEPARTURE, return_date=DEPARTURE + timedelta(days=6),
+        source="google_flights", departure_time="18:30", return_time="20:15",
+    )
 
 
 def _response(text="<html>ok</html>", url="https://www.google.com/travel/flights", status=200):
@@ -86,10 +126,7 @@ def _response(text="<html>ok</html>", url="https://www.google.com/travel/flights
 
 
 def _real_scraper_error(scenario):
-    """
-    ScraperError ottenuta eseguendo lo scraper VERO (search_leg / consenso), con il
-    solo client HTTP mockato: la catena `__cause__` e' quella reale.
-    """
+    """ScraperError ottenuta eseguendo lo scraper VERO con il solo client HTTP mockato."""
     with patch("scrapers.google_flights._client") as client:
         if scenario == "timeout":
             client.get.side_effect = primp.TimeoutError("operation timed out")
@@ -122,7 +159,7 @@ def _real_scraper_error(scenario):
 # ----------------------------------------------------------- 1. classificazione ----
 
 class TestRetryClassification:
-    """Quali errori si ritentano. Classificazione sul TIPO della causa, mai sul testo."""
+    """Quali errori si ritentano: solo dagli attributi strutturati di ScraperError."""
 
     RETRYABLE = ["timeout", "dns_timeout", "http_500", "http_502", "http_503", "http_504",
                  "http_429"]
@@ -137,53 +174,44 @@ class TestRetryClassification:
     def test_other_errors_from_the_real_scraper_are_not_retryable(self, scenario):
         assert scheduler._is_retryable(_real_scraper_error(scenario)) is False
 
-    def test_consent_post_timeout_is_classified_by_its_transport_cause(self):
+    def test_consent_post_timeout_is_classified_by_its_transport_error(self):
         """
-        Decisione da confermare (vedi report): il brief dice "consent error: no retry",
-        inteso come errore STRUTTURALE del consenso (nessun form / nessuna action: causa
-        assente). Un timeout nel POST del consenso e' invece un timeout di trasporto.
+        Interpretazione da confermare (vedi report): "consent error: no retry" vale per gli
+        errori STRUTTURALI del consenso (nessun form/action); un timeout nel POST del consenso
+        e' un timeout di trasporto.
         """
         assert scheduler._is_retryable(_real_scraper_error("consent_post_timeout")) is True
 
     @pytest.mark.parametrize("status,expected", [
         (429, True), (500, True), (501, True), (502, True), (503, True), (504, True), (599, True),
         (403, False), (400, False), (401, False), (404, False), (408, False), (499, False),
+        (None, False),
     ])
     def test_http_status_boundaries(self, status, expected):
-        error = _scraper_error(f"errore HTTP {status}", _status_error(status))
-        assert scheduler._is_retryable(error) is expected
+        assert scheduler._is_retryable(_error("errore", status=status)) is expected
 
-    @pytest.mark.parametrize("cause", [
-        AttributeError("'NoneType' object has no attribute 'text'"), IndexError("fuori range"),
-        KeyError("chiave"), TypeError("tipo"), ValueError("valore"),
-        FlightsNotFound("no flights found; received error"),
-    ], ids=lambda c: type(c).__name__)
-    def test_parser_and_unknown_causes_are_not_retryable(self, cause):
-        assert scheduler._is_retryable(_scraper_error("analisi fallita", cause)) is False
+    def test_timeout_flag_makes_the_error_retryable(self):
+        assert scheduler._is_retryable(_error("errore", timed_out=True)) is True
+        assert scheduler._is_retryable(_error("errore", timed_out=False)) is False
 
-    def test_error_without_cause_is_not_retryable(self):
-        assert scheduler._is_retryable(_scraper_error("consenso senza form")) is False
+    @pytest.mark.parametrize("error", [
+        _flights_not_found(), _parser_error(), _consent_structure_error(),
+        _error("errore", cause=ValueError("x")), ScraperError("solo messaggio"),
+    ], ids=["flights_not_found", "parser", "consent_structure", "unknown_cause", "bare"])
+    def test_structural_and_unknown_errors_are_not_retryable(self, error):
+        assert scheduler._is_retryable(error) is False
 
-    def test_classification_ignores_the_message_text(self):
-        """Il testo dice 'timeout 503' ma la causa e' un errore del parser: NO retry."""
-        misleading = _scraper_error("timeout HTTP 503 Service Unavailable 429",
-                                    AttributeError("x"))
+    def test_classification_ignores_message_and_cause(self):
+        """Conta solo il dato strutturale: messaggio e causa non decidono."""
+        misleading = _error("timeout HTTP 503 Service Unavailable 429", cause=AttributeError("x"))
         assert scheduler._is_retryable(misleading) is False
-        """... e viceversa: messaggio neutro, causa timeout: SI' retry."""
-        neutral = _scraper_error("errore", primp.TimeoutError("t"))
-        assert scheduler._is_retryable(neutral) is True
+        neutral_but_timeout = _error("errore", timed_out=True, cause=AttributeError("x"))
+        assert scheduler._is_retryable(neutral_but_timeout) is True
 
-    def test_unreadable_http_status_is_not_retried_and_is_logged(self, caplog):
-        """Layout inatteso di primp (args[0] non e' un int): scelta prudente + log."""
-        odd = _scraper_error("errore HTTP", primp.StatusError("HTTP 503 Service Unavailable"))
-
-        with caplog.at_level(logging.WARNING, logger="flight_bot.scheduler"):
-            assert scheduler._is_retryable(odd) is False
-
-        assert any("status HTTP" in r.getMessage() for r in caplog.records)
-
-    def test_status_error_without_args_is_not_retryable(self):
-        assert scheduler._is_retryable(_scraper_error("errore", primp.StatusError())) is False
+    def test_scheduler_does_not_depend_on_the_http_library(self):
+        """L'accoppiamento a primp resta nello scraper: lo scheduler non lo importa."""
+        assert not hasattr(scheduler, "primp")
+        assert "primp" not in inspect.getsource(scheduler)
 
 
 # ------------------------------------------------------------------- 2. backoff ----
@@ -205,13 +233,11 @@ class TestBackoff:
         with patch.object(scheduler.random, "uniform", return_value=factor) as uniform:
             assert scheduler._retry_delay(0) == pytest.approx(first)
             assert scheduler._retry_delay(1) == pytest.approx(second)
-        # il jitter e' estratto dall'intervallo [1-20%, 1+20%]
         uniform.assert_called_with(pytest.approx(0.8), pytest.approx(1.2))
 
     def test_jitter_is_applied(self):
         with patch.object(scheduler.random, "uniform", return_value=1.15):
             assert scheduler._retry_delay(0) == pytest.approx(69.0)
-            assert scheduler._retry_delay(0) != 60.0
 
     def test_delays_stay_within_bounds_with_the_real_random_generator(self):
         state = random.getstate()
@@ -223,8 +249,8 @@ class TestBackoff:
             random.setstate(state)
         assert all(48.0 <= d <= 72.0 for d in first)
         assert all(144.0 <= d <= 180.0 for d in second)   # mai oltre il tetto
-        assert len(set(first)) > 100 and len(set(second)) > 100   # il jitter varia davvero
-        assert min(first) < 55 and max(first) > 65        # ~60 s, non fisso
+        assert len(set(first)) > 100 and len(set(second)) > 100
+        assert min(first) < 55 and max(first) > 65
 
     def test_wait_is_cooperative_and_uses_asyncio_sleep(self, monkeypatch):
         sleep = AsyncMock()
@@ -236,162 +262,291 @@ class TestBackoff:
         sleep.assert_awaited_once_with(42)
 
 
-# ------------------------------------------------------ 3. sequenza dei tentativi ----
+# ------------------------------------------------------------ infrastruttura di ciclo ----
 
-def _search(search_id, origin="PSA", destination="CAG"):
+def _search(search_id, origin="PSA", destination="CAG", return_date=True):
     return SimpleNamespace(
         id=search_id,
         flight_key=f"{origin}{destination}{search_id:04d}",
         origin=origin,
         destination=destination,
-        departure_date=datetime.now() + timedelta(days=30 + search_id),
-        return_date=datetime.now() + timedelta(days=32 + search_id),
-        monitor_type=scheduler.MonitorType.MANUAL,
+        departure_date=datetime.now() + timedelta(days=30 + search_id),   # univoca per ricerca
+        return_date=(datetime.now() + timedelta(days=32 + search_id)) if return_date else None,
+        monitor_type=MonitorType.MANUAL,
         telegram_topic_id=100 + search_id,
         earliest_departure_hour=None, latest_departure_hour=None,
         earliest_return_hour=None, latest_return_hour=None,
     )
 
 
-def _price(value):
-    return ScrapedPrice(
-        price_eur=value, origin="PSA", destination="CAG",
-        departure_date=datetime(2026, 12, 25), return_date=datetime(2026, 12, 31),
-        source="google_flights", departure_time="18:30", return_time="20:15",
-    )
+class _TooManyAttempts(BaseException):
+    """BaseException: il `except Exception` del ciclo NON la inghiotte, il test fallisce."""
 
 
-def _timeout():
-    return _scraper_error("Richiesta GET a Google fallita (TimeoutError)",
-                          primp.TimeoutError("operation timed out"))
-
-
-def _http(status):
-    return _scraper_error(f"Google ha risposto con errore HTTP {status}", _status_error(status))
-
-
-def _scrape_sequence(outcomes):
+def _scripted_scrape(searches, outcomes, events):
     """
-    side_effect per scrape_google: esiti nell'ordine delle chiamate. Se lo scheduler
-    chiama piu' volte del previsto il test FALLISCE (non si blocca, non cicla).
+    scrape_google finto: `outcomes[search.id]` = esiti per TENTATIVO (valore o eccezione).
+    Un tentativo oltre il copione solleva _TooManyAttempts (retry di troppo = test rosso).
     """
-    calls = []
+    by_departure = {s.departure_date: s.id for s in searches}
+    attempts = collections.Counter()
 
-    def scrape(*args, **kwargs):
-        calls.append((args, kwargs))
-        if len(calls) > len(outcomes):
-            raise AssertionError(f"scrape_google chiamata {len(calls)} volte: troppi tentativi")
-        outcome = outcomes[len(calls) - 1]
+    def scrape(origin, destination, departure_date, return_date=None, **kwargs):
+        search_id = by_departure[departure_date]
+        attempts[search_id] += 1
+        events.append(("scrape", search_id))
+        script = outcomes[search_id]
+        if attempts[search_id] > len(script):
+            raise _TooManyAttempts(f"ricerca {search_id}: tentativo {attempts[search_id]} non previsto")
+        outcome = script[attempts[search_id] - 1]
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
-    scrape.calls = calls
-    return scrape
+    return scrape, attempts
 
 
-def _retry(outcomes, jitter=1.0):
-    """Esegue _scrape_with_retry. Ritorna (risultato_o_eccezione, scrape_fn, sleep_mock)."""
-    scrape = _scrape_sequence(outcomes)
-    sleep = AsyncMock()
-    search = _search(1)
-    with patch.object(scheduler, "scrape_google", side_effect=scrape), \
-         patch.object(scheduler, "_sleep", new=sleep), \
-         patch.object(scheduler.random, "uniform", return_value=jitter):
-        try:
-            result = asyncio.run(scheduler._scrape_with_retry(search, direct_only=True))
-        except ScraperError as error:
-            result = error
-    return result, scrape, sleep
+def _bot():
+    return MagicMock(send_message=AsyncMock())
 
 
-def _delays(sleep):
-    return [call.args[0] for call in sleep.await_args_list]
+def _run_cycle(searches, outcomes, *, bot=None, jitter=1.0, session=None, events=None,
+               price_alert=None):
+    """
+    Esegue UN ciclo con DB (mock), Bot, scraper, alert di prezzo e attese mockati.
+    Ritorna un oggetto con: session, price_alert, bot, events, attempts, delays, scrapes.
+    """
+    events = [] if events is None else events
+    session = session or MagicMock()
+    session.query.return_value.filter_by.return_value.all.return_value = searches
+    session.commit.side_effect = lambda: events.append(("commit",))
+    bot = bot or _bot()
+    price_alert = price_alert or AsyncMock()
+    scrape, attempts = _scripted_scrape(searches, outcomes, events)
+
+    async def fake_sleep(seconds):
+        events.append(("sleep", seconds))
+
+    with patch.object(scheduler, "SessionLocal", return_value=session), \
+         patch.object(scheduler, "Bot", return_value=bot), \
+         patch.object(scheduler, "_sleep", new=fake_sleep), \
+         patch.object(scheduler.random, "uniform", return_value=jitter), \
+         patch.object(scheduler, "scrape_google", side_effect=scrape), \
+         patch.object(scheduler, "maybe_send_alert", price_alert):
+        asyncio.run(scheduler.run_scraping_cycle())
+    return SimpleNamespace(
+        session=session, price_alert=price_alert, bot=bot, events=events, attempts=attempts,
+        delays=[e[1] for e in events if e[0] == "sleep"],
+        scrapes=[e[1] for e in events if e[0] == "scrape"],
+    )
 
 
-class TestRetrySequence:
+def _snapshot_ids(cycle):
+    return [call.args[0].search_id for call in cycle.session.add.call_args_list]
 
-    def test_success_does_not_retry(self):
-        result, scrape, sleep = _retry([_price(50.0)])
 
-        assert result.price_eur == 50.0
-        assert len(scrape.calls) == 1
-        sleep.assert_not_awaited()
+def _price_alert_ids(cycle):
+    return [call.args[2].id for call in cycle.price_alert.call_args_list]
 
-    def test_valid_no_flights_does_not_retry(self):
-        result, scrape, sleep = _retry([None])
 
-        assert result is None
-        assert len(scrape.calls) == 1
-        sleep.assert_not_awaited()
+# --------------------------------------------------------------- 3. retry per CICLO ----
 
-    @pytest.mark.parametrize("error", [_timeout(), _http(500), _http(503), _http(429)],
-                             ids=["timeout", "http500", "http503", "http429"])
-    def test_temporary_error_is_retried_and_the_retry_can_succeed(self, error):
-        result, scrape, sleep = _retry([error, _price(55.0)])
+class TestBatchRetry:
 
-        assert result.price_eur == 55.0
-        assert len(scrape.calls) == 2
-        assert _delays(sleep) == [pytest.approx(60.0)]
+    def test_all_searches_succeed_without_any_retry(self):
+        searches = [_search(1), _search(2), _search(3)]
 
-    @pytest.mark.parametrize("error", [
-        _http(403), _http(404),
-        _scraper_error("risposta di errore", FlightsNotFound("no flights found; received error")),
-        _scraper_error("analisi fallita", AttributeError("x")),
-        _scraper_error("consenso senza form"),
-    ], ids=["http403", "http404", "flights_not_found", "parser", "consent_structure"])
-    def test_non_retryable_error_fails_immediately(self, error):
-        result, scrape, sleep = _retry([error, _price(55.0)])
+        cycle = _run_cycle(searches, {1: [_price(10)], 2: [_price(20)], 3: [None]})
 
-        assert result is error                      # propagato com'e', nessun retry
-        assert len(scrape.calls) == 1
-        sleep.assert_not_awaited()
+        assert cycle.scrapes == [1, 2, 3]                 # una sola chiamata ciascuna
+        assert cycle.delays == []
+        assert _snapshot_ids(cycle) == [1, 2]             # None = nessun volo, nessuno snapshot
+        assert scheduler._consecutive_failures == {}
 
-    def test_second_retry_runs_when_the_first_retry_fails(self):
-        result, scrape, sleep = _retry([_timeout(), _http(503), _price(60.0)])
+    def test_only_the_failed_retryable_searches_are_retried(self):
+        """A ok, B timeout, C ok, D 503: il retry riguarda SOLO B e D."""
+        searches = [_search(1), _search(2), _search(3), _search(4)]
+        outcomes = {1: [_price(10)], 2: [_timeout(), _price(22)], 3: [_price(30)],
+                    4: [_http(503), _http(503), _http(503)]}
 
-        assert result.price_eur == 60.0             # il 2° retry (3° tentativo) riesce
-        assert len(scrape.calls) == 3
-        assert _delays(sleep) == [pytest.approx(60.0), pytest.approx(180.0)]
+        cycle = _run_cycle(searches, outcomes)
 
-    def test_all_attempts_fail_gives_definitive_failure_with_the_last_error(self):
-        errors = [_timeout(), _http(503), _http(429)]
-        result, scrape, sleep = _retry(errors)
+        # eventi di scraping e attesa, senza i commit di dati
+        flow = [e for e in cycle.events if e[0] != "commit"]
+        assert flow == [
+            ("scrape", 1), ("scrape", 2), ("scrape", 3), ("scrape", 4),
+            ("sleep", pytest.approx(60.0)),
+            ("scrape", 2), ("scrape", 4),
+            ("sleep", pytest.approx(180.0)),
+            ("scrape", 4),
+        ]
+        assert dict(cycle.attempts) == {1: 1, 2: 2, 3: 1, 4: 3}
 
-        assert result is errors[-1]
-        assert len(scrape.calls) == 3
-        assert len(_delays(sleep)) == 2
+    def test_successful_searches_are_stored_exactly_once(self):
+        searches = [_search(1), _search(2), _search(3), _search(4)]
+        outcomes = {1: [_price(10)], 2: [_timeout(), _price(22)], 3: [_price(30)],
+                    4: [_http(503)] * 3}
+
+        cycle = _run_cycle(searches, outcomes)
+
+        assert sorted(_snapshot_ids(cycle)) == [1, 2, 3]  # nessun duplicato, D mai salvata
+        assert sorted(_price_alert_ids(cycle)) == [1, 2, 3]
+        assert [c.args[0].price_eur for c in cycle.session.add.call_args_list
+                if c.args[0].search_id == 2] == [22]
+
+    def test_search_recovering_during_a_retry_counts_as_a_success(self):
+        scheduler._consecutive_failures[2] = 2
+
+        cycle = _run_cycle([_search(1), _search(2)],
+                           {1: [_price(10)], 2: [_timeout(), _price(22)]})
+
+        assert 2 not in scheduler._consecutive_failures    # azzerata
+        assert sorted(_snapshot_ids(cycle)) == [1, 2]
+
+    def test_recoveries_at_different_rounds(self):
+        """B recupera al 1° retry, C al 2°; D non recupera: al 2° retry restano C e D."""
+        searches = [_search(1), _search(2), _search(3)]
+        outcomes = {1: [_timeout(), _price(11)], 2: [_timeout(), _timeout(), _price(22)],
+                    3: [_timeout(), _timeout(), _timeout()]}
+
+        cycle = _run_cycle(searches, outcomes)
+
+        assert cycle.scrapes == [1, 2, 3, 1, 2, 3, 2, 3]
+        assert cycle.delays == [pytest.approx(60.0), pytest.approx(180.0)]
+        assert sorted(_snapshot_ids(cycle)) == [1, 2]
+        assert scheduler._consecutive_failures == {3: 1}
 
     def test_never_more_than_two_retries(self):
-        """Anche se lo scraper continuasse a fallire: 1 tentativo + 2 retry, poi stop."""
-        result, scrape, sleep = _retry([_timeout()] * 3)    # una 4ª chiamata farebbe fallire il test
+        cycle = _run_cycle([_search(1)], {1: [_timeout()] * 3})    # un 4° tentativo = test rosso
 
-        assert isinstance(result, ScraperError)
-        assert len(scrape.calls) == 3
-        assert sleep.await_count == 2
+        assert cycle.attempts[1] == 3
+        assert len(cycle.delays) == 2
+        assert scheduler._consecutive_failures == {1: 1}
 
-    def test_a_non_retryable_error_during_a_retry_stops_the_retries(self):
-        forbidden = _http(403)
-        result, scrape, sleep = _retry([_timeout(), forbidden, _price(60.0)])
+    @pytest.mark.parametrize("error_factory", [
+        lambda: _http(403), lambda: _http(404), _flights_not_found, _parser_error,
+        _consent_structure_error,
+    ], ids=["http403", "http404", "flights_not_found", "parser", "consent_structure"])
+    def test_non_retryable_error_is_not_retried(self, error_factory):
+        cycle = _run_cycle([_search(1), _search(2)],
+                           {1: [error_factory()], 2: [_price(5)]})   # un 2° tentativo = test rosso
 
-        assert result is forbidden
-        assert len(scrape.calls) == 2
-        assert sleep.await_count == 1
+        assert dict(cycle.attempts) == {1: 1, 2: 1}
+        assert cycle.delays == []                                    # nessuna attesa
+        assert scheduler._consecutive_failures == {1: 1}
 
-    def test_every_attempt_uses_the_same_arguments(self):
-        _, scrape, _ = _retry([_timeout(), _timeout(), _price(1.0)])
+    @pytest.mark.parametrize("error_factory", [
+        _timeout, lambda: _http(429), lambda: _http(500), lambda: _http(503), lambda: _http(504),
+    ], ids=["timeout", "http429", "http500", "http503", "http504"])
+    def test_temporary_error_is_retried_once_after_the_first_wait(self, error_factory):
+        cycle = _run_cycle([_search(1)], {1: [error_factory(), _price(9)]})
 
-        assert len({repr(c) for c in scrape.calls}) == 1
-        args, kwargs = scrape.calls[0]
-        assert args[:2] == ("PSA", "CAG") and kwargs == {"direct_only": True}
+        assert cycle.attempts[1] == 2
+        assert cycle.delays == [pytest.approx(60.0)]
+        assert _snapshot_ids(cycle) == [1]
 
-    def test_retry_waits_are_logged_without_a_traceback(self, caplog):
+    def test_retry_error_that_is_not_retryable_stops_that_search(self):
+        """Al retry l'errore diventa un 403: la ricerca non viene piu' ritentata."""
+        cycle = _run_cycle([_search(1), _search(2)],
+                           {1: [_timeout(), _http(403)], 2: [_timeout(), _timeout(), _price(1)]})
+
+        assert dict(cycle.attempts) == {1: 2, 2: 3}
+        assert scheduler._consecutive_failures == {1: 1}
+
+    def test_waits_happen_once_per_round_not_once_per_search(self):
+        """Il punto centrale: con 104 ricerche in timeout le attese restano DUE, non 208."""
+        searches = [_search(i) for i in range(1, 105)]
+        outcomes = {s.id: [_timeout()] * 3 for s in searches}
+
+        cycle = _run_cycle(searches, outcomes, jitter=1.2)         # jitter massimo
+
+        assert len(cycle.delays) == 2
+        assert sum(cycle.delays) <= 60 * 1.2 + 180                 # <= 252 s per ciclo, qualunque N
+        assert all(cycle.attempts[s.id] == 3 for s in searches)    # ma ogni ricerca ha 3 tentativi
+        assert len(cycle.scrapes) == 104 * 3
+
+    def test_retry_logging_is_a_summary_per_round_with_no_traceback(self, caplog):
+        searches = [_search(1), _search(2), _search(3)]
+        outcomes = {1: [_timeout(), _price(1)], 2: [_timeout()] * 3, 3: [_price(3)]}
+
         with caplog.at_level(logging.INFO, logger="flight_bot.scheduler"):
-            _retry([_timeout(), _price(1.0)])
+            _run_cycle(searches, outcomes)
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert len(warnings) == 1 and "search_id=1" in warnings[0].getMessage()
+        assert len(warnings) == 2 and all(r.exc_info is None for r in warnings)
+        assert "2 ricerche su 3" in warnings[0].getMessage()
         assert "retry 1/2" in warnings[0].getMessage()
-        assert warnings[0].exc_info is None
+        assert "1 ricerche su 3" in warnings[1].getMessage()
+        assert "retry 2/2" in warnings[1].getMessage()
+
+
+class TestCycleIsolation:
+
+    def test_a_failure_never_stops_the_other_searches(self):
+        searches = [_search(1), _search(2), _search(3)]
+
+        cycle = _run_cycle(searches, {1: [_price(1)], 2: [_timeout()] * 3, 3: [_price(3)]})
+
+        assert sorted(_snapshot_ids(cycle)) == [1, 3]
+        assert sorted(_price_alert_ids(cycle)) == [1, 3]
+
+    def test_failed_searches_create_no_snapshot_and_no_price_alert(self):
+        searches = [_search(1), _search(2)]
+
+        cycle = _run_cycle(searches, {1: [_timeout()] * 3, 2: [_http(403)]})
+
+        cycle.session.add.assert_not_called()
+        cycle.price_alert.assert_not_called()
+
+    def test_unexpected_exceptions_are_isolated_not_retried_and_not_counted(self, caplog):
+        searches = [_search(1), _search(2), _search(3)]
+        scheduler._consecutive_failures[2] = 2
+
+        with caplog.at_level(logging.INFO, logger="flight_bot.scheduler"):
+            cycle = _run_cycle(searches, {1: [_price(1)], 2: [ValueError("bug")], 3: [_price(3)]})
+
+        assert dict(cycle.attempts) == {1: 1, 2: 1, 3: 1}          # nessun retry
+        assert cycle.delays == []
+        assert sorted(_snapshot_ids(cycle)) == [1, 3]
+        assert scheduler._consecutive_failures == {2: 2}           # ne' +1 ne' azzerato
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1 and "search_id=2" in errors[0].getMessage()
+        assert isinstance(errors[0].exc_info[1], ValueError)
+
+    def test_definitive_failure_is_logged_once_with_traceback_and_context(self, caplog):
+        searches = [_search(1), _search(2, origin="CAG", destination="PSA")]
+        last = _timeout()
+
+        with caplog.at_level(logging.INFO, logger="flight_bot.scheduler"):
+            _run_cycle(searches, {1: [_price(1)], 2: [_timeout(), _timeout(), last]})
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1                                    # uno solo, non uno per tentativo
+        message = errors[0].getMessage()
+        assert "search_id=2" in message and "CAGPSA0002" in message
+        assert "CAG" in message and "PSA" in message
+        assert errors[0].exc_info[1] is last                       # traceback dell'ultimo errore
+        assert str(last.__cause__) in caplog.text
+
+    def test_the_next_cycle_runs_normally_after_a_failing_one(self):
+        searches = [_search(1), _search(2)]
+
+        first = _run_cycle(searches, {1: [_price(1)], 2: [_timeout()] * 3})
+        second = _run_cycle(searches, {1: [_price(2)], 2: [_price(3)]})
+
+        assert sorted(_snapshot_ids(first)) == [1]
+        assert sorted(_snapshot_ids(second)) == [1, 2]
+        assert scheduler._consecutive_failures == {}
+
+    def test_past_searches_are_skipped_and_never_counted(self):
+        past = _search(1)
+        past.departure_date = datetime.now() - timedelta(days=2)
+        scheduler._consecutive_failures[1] = 2
+
+        cycle = _run_cycle([past, _search(2)], {1: [], 2: [_price(5)]})
+
+        assert cycle.scrapes == [2]
+        assert 1 not in scheduler._consecutive_failures            # contatore potato
+        assert _snapshot_ids(cycle) == [2]
 
 
 # --------------------------------------------------------- 4. failure tracking ----
@@ -399,9 +554,7 @@ class TestRetrySequence:
 class TestFailureTracking:
 
     def test_consecutive_failures_count_up(self):
-        assert scheduler._record_failure(1) == 1
-        assert scheduler._record_failure(1) == 2
-        assert scheduler._record_failure(1) == 3
+        assert [scheduler._record_failure(1) for _ in range(3)] == [1, 2, 3]
 
     def test_success_resets_the_counter(self):
         scheduler._record_failure(1)
@@ -409,156 +562,402 @@ class TestFailureTracking:
 
         scheduler._record_success(1)
 
-        assert 1 not in scheduler._consecutive_failures
+        assert scheduler._consecutive_failures == {}
         assert scheduler._record_failure(1) == 1
 
-    def test_success_without_previous_failures_is_harmless(self):
-        scheduler._record_success(99)
-        assert scheduler._consecutive_failures == {}
-
     def test_different_searches_have_independent_counters(self):
-        scheduler._record_failure(1)
-        scheduler._record_failure(1)
-        scheduler._record_failure(2)
+        for search_id in (1, 1, 2):
+            scheduler._record_failure(search_id)
 
         assert scheduler._consecutive_failures == {1: 2, 2: 1}
-
-        scheduler._record_success(2)                 # il successo di B non tocca A
-
+        scheduler._record_success(2)
         assert scheduler._consecutive_failures == {1: 2}
 
+    def test_stale_counters_are_forgotten(self):
+        scheduler._consecutive_failures.update({1: 3, 2: 1, 3: 2})
 
-# ---------------------------------------------------------- 5. ciclo end-to-end ----
+        scheduler._forget_stale_failures({2})
 
-def _run_cycle(searches, outcomes_by_search, bot=None, sleep=None):
-    """
-    Esegue un ciclo con DB, Bot, scraper, alert di prezzo e attese mockati.
-    `outcomes_by_search[i]`: lista di esiti (uno per tentativo) della ricerca i.
-    Ritorna (session, price_alert_mock, sleep_mock, bot_mock).
-    """
-    session = MagicMock()
-    session.query.return_value.filter_by.return_value.all.return_value = searches
-    price_alert = AsyncMock()
-    sleep = sleep or AsyncMock()
-    bot = bot or MagicMock(send_message=AsyncMock())
-    scrapers = {s.departure_date: _scrape_sequence(outcomes_by_search[i])
-                for i, s in enumerate(searches)}
+        assert scheduler._consecutive_failures == {2: 1}
 
-    def scrape(origin, destination, departure_date, return_date=None, **kwargs):
-        return scrapers[departure_date](origin, destination, departure_date, return_date, **kwargs)
-
-    with patch.object(scheduler, "SessionLocal", return_value=session), \
-         patch.object(scheduler, "Bot", return_value=bot), \
-         patch.object(scheduler, "_sleep", new=sleep), \
-         patch.object(scheduler.random, "uniform", return_value=1.0), \
-         patch.object(scheduler, "scrape_google", side_effect=scrape), \
-         patch.object(scheduler, "maybe_send_alert", price_alert):
-        asyncio.run(scheduler.run_scraping_cycle())
-    return session, price_alert, sleep, bot
-
-
-def _snapshot_ids(session):
-    return [call.args[0].search_id for call in session.add.call_args_list]
-
-
-def _price_alert_ids(price_alert):
-    return [call.args[2].id for call in price_alert.call_args_list]
-
-
-class TestSchedulerCycleWithRetry:
-
-    def test_search_recovering_after_a_retry_produces_the_normal_result(self):
-        searches = [_search(1)]
-
-        session, price_alert, sleep, _ = _run_cycle(searches, [[_timeout(), _price(70.0)]])
-
-        assert [(s.args[0].search_id, s.args[0].price_eur)
-                for s in session.add.call_args_list] == [(1, 70.0)]
-        assert _price_alert_ids(price_alert) == [1]          # alert di prezzo normale
-        assert sleep.await_count == 1
-        assert scheduler._consecutive_failures == {}
-
-    def test_definitive_failure_creates_no_snapshot_and_no_price_alert(self):
-        searches = [_search(1)]
-
-        session, price_alert, sleep, _ = _run_cycle(searches, [[_timeout()] * 3])
-
-        session.add.assert_not_called()                      # nessuno snapshot falso
-        session.commit.assert_not_called()
-        price_alert.assert_not_called()                      # nessun alert di prezzo falso
-        assert sleep.await_count == 2                        # 2 retry prima di arrendersi
-
-    def test_definitive_failure_does_not_stop_the_following_searches(self):
-        searches = [_search(1), _search(2), _search(3)]
-
-        session, price_alert, sleep, _ = _run_cycle(
-            searches, [[_timeout()] * 3, [_price(50.0)], [_http(403)]])
-
-        assert _snapshot_ids(session) == [2]
-        assert _price_alert_ids(price_alert) == [2]
-        assert scheduler._consecutive_failures == {1: 1, 3: 1}
-
-    def test_a_failure_in_the_middle_lets_later_searches_run(self):
-        searches = [_search(1), _search(2), _search(3)]
-
-        session, price_alert, _, _ = _run_cycle(
-            searches, [[_price(50.0)], [_http(503)] * 3, [_price(60.0)]])
-
-        assert _snapshot_ids(session) == [1, 3]
-        assert _price_alert_ids(price_alert) == [1, 3]
-
-    def test_retries_of_one_search_count_as_a_single_failure(self):
-        """3 tentativi falliti nello stesso ciclo = 1 fallimento (non 3): evita alert immediati."""
-        _run_cycle([_search(1)], [[_timeout()] * 3])
+    def test_retries_in_the_same_cycle_count_as_a_single_failure(self):
+        _run_cycle([_search(1)], {1: [_timeout()] * 3})
 
         assert scheduler._consecutive_failures == {1: 1}
 
-    def test_non_retryable_failure_counts_too(self):
-        _run_cycle([_search(1)], [[_http(403)]])
+    def test_each_cycle_adds_exactly_one_failure(self):
+        search = _search(1)
+        for expected in (1, 2, 3):
+            _run_cycle([search], {1: [_timeout()] * 3})
+            assert scheduler._consecutive_failures == {1: expected}
+
+    def test_non_retryable_failure_counts_once(self):
+        _run_cycle([_search(1)], {1: [_http(403)]})
 
         assert scheduler._consecutive_failures == {1: 1}
 
-    def test_valid_no_flights_resets_the_counter(self):
+    @pytest.mark.parametrize("success", [_price(80.0), None], ids=["price", "no_flights"])
+    def test_any_valid_response_resets_the_counter(self, success):
         scheduler._consecutive_failures[1] = 2
 
-        _run_cycle([_search(1)], [[None]])
+        _run_cycle([_search(1)], {1: [success]})
 
         assert scheduler._consecutive_failures == {}
 
-    def test_price_result_resets_the_counter(self):
+    def test_valid_response_resets_the_counter_even_if_storing_it_fails(self):
+        """Lo scraper ha risposto: e' un successo dello scraper, anche se il salvataggio/alert poi fallisce."""
         scheduler._consecutive_failures[1] = 2
+        failing_alert = AsyncMock(side_effect=ValueError("errore negli alert di prezzo"))
 
-        _run_cycle([_search(1)], [[_price(80.0)]])
+        with pytest.raises(ValueError, match="alert di prezzo"):   # comportamento preesistente: si propaga
+            _run_cycle([_search(1)], {1: [_price(5.0)]}, price_alert=failing_alert)
 
         assert scheduler._consecutive_failures == {}
 
     def test_success_after_retry_resets_the_counter(self):
         scheduler._consecutive_failures[1] = 2
 
-        _run_cycle([_search(1)], [[_timeout(), _price(80.0)]])
+        _run_cycle([_search(1)], {1: [_timeout(), _price(1)]})
 
         assert scheduler._consecutive_failures == {}
 
-    def test_unexpected_exceptions_neither_count_nor_reset(self):
-        scheduler._consecutive_failures[1] = 2
-
-        _run_cycle([_search(1), _search(2)], [[ValueError("bug")], [_price(1.0)]])
-
-        assert scheduler._consecutive_failures == {1: 2}     # invariato
-
-    def test_counters_are_per_search_across_cycles(self):
+    def test_counters_are_isolated_between_searches_across_cycles(self):
         a, b = _search(1), _search(2)
 
-        _run_cycle([a, b], [[_http(403)], [_price(1.0)]])
-        _run_cycle([a, b], [[_http(403)], [_http(403)]])
+        _run_cycle([a, b], {1: [_http(403)], 2: [_price(1)]})
+        _run_cycle([a, b], {1: [_http(403)], 2: [_http(403)]})
 
         assert scheduler._consecutive_failures == {1: 2, 2: 1}
 
-    def test_attempts_do_not_block_the_event_loop_during_the_wait(self):
-        """
-        L'attesa del backoff cede il controllo all'event loop: un task concorrente
-        (il bot) continua a girare mentre il ciclo aspetta il retry.
-        """
+    def test_a_search_that_is_no_longer_checked_loses_its_counter(self):
+        scheduler._consecutive_failures.update({1: 3, 2: 1})
+
+        _run_cycle([_search(2)], {2: [_http(403)]})               # la ricerca 1 non c'e' piu'
+
+        assert scheduler._consecutive_failures == {2: 2}
+
+
+# ---------------------------------------------------------- 5. alert AGGREGATO ----
+
+def _failing_cycle(searches, bot, error_factory=lambda: _http(403), attempts=1):
+    """Un ciclo in cui TUTTE le ricerche falliscono (`attempts`: 1 se non ritentabile, 3 se temporaneo)."""
+    return _run_cycle(searches, {s.id: [error_factory() for _ in range(attempts)] for s in searches},
+                      bot=bot)
+
+
+class TestAggregatedAdminAlert:
+
+    def test_no_alert_below_the_threshold(self):
+        bot = _bot()
+        searches = [_search(1)]
+
+        _failing_cycle(searches, bot)
+        _failing_cycle(searches, bot)
+
+        bot.send_message.assert_not_awaited()
+        assert scheduler._consecutive_failures == {1: 2}
+
+    def test_alert_when_a_search_reaches_three_consecutive_failures(self):
+        bot = _bot()
+        searches = [_search(1)]
+
+        for _ in range(3):
+            _failing_cycle(searches, bot)
+
+        bot.send_message.assert_awaited_once()
+        kwargs = bot.send_message.await_args.kwargs
+        assert kwargs["chat_id"] == scheduler.TELEGRAM_CHAT_ID == 1
+        assert "message_thread_id" not in kwargs                  # topic generale
+
+    def test_no_burst_of_alerts_for_a_global_outage(self):
+        """104 ricerche in errore per molti cicli: UN solo messaggio in totale."""
+        bot = _bot()
+        searches = [_search(i) for i in range(1, 105)]
+
+        for _ in range(6):
+            _failing_cycle(searches, bot, error_factory=_timeout, attempts=3)
+
+        assert bot.send_message.await_count == 1
+        assert "104 ricerche hanno fallito" in bot.send_message.await_args.kwargs["text"]
+
+    def test_alert_is_aggregated_and_counts_only_persistent_failures(self):
+        bot = _bot()
+        failing = [_search(i) for i in range(1, 8)]               # 7 ricerche sempre in errore
+        healthy = [_search(i) for i in range(8, 20)]              # 12 ricerche che riescono
+        outcomes = {**{s.id: [_http(403)] for s in failing}, **{s.id: [_price(1)] for s in healthy}}
+        for _ in range(3):
+            outcomes = {**{s.id: [_http(403)] for s in failing},
+                        **{s.id: [_price(1)] for s in healthy}}
+            _run_cycle(failing + healthy, outcomes, bot=bot)
+
+        assert bot.send_message.await_count == 1
+        assert "7 ricerche hanno fallito almeno 3 controlli consecutivi" in (
+            bot.send_message.await_args.kwargs["text"])
+
+    def test_no_duplicate_alert_in_the_following_cycles(self):
+        bot = _bot()
+        searches = [_search(1), _search(2)]
+        for _ in range(3):
+            _failing_cycle(searches, bot)
+        assert bot.send_message.await_count == 1
+
+        for _ in range(5):
+            _failing_cycle(searches, bot)
+
+        assert bot.send_message.await_count == 1
+        assert scheduler._admin_alert_sent is True
+
+    def test_retries_alone_never_trigger_an_alert(self):
+        bot = _bot()
+
+        _run_cycle([_search(1)], {1: [_timeout()] * 3}, bot=bot)  # 3 tentativi, 1 solo fallimento
+
+        bot.send_message.assert_not_awaited()
+
+    def test_partial_recovery_does_not_reset_the_alert_state(self):
+        """Meta' delle ricerche recupera, l'altra meta' continua a fallire: nessun reset, nessun nuovo alert."""
+        bot = _bot()
+        searches = [_search(i) for i in range(1, 11)]
+        for _ in range(3):
+            _failing_cycle(searches, bot)
+        assert bot.send_message.await_count == 1
+
+        def partial():
+            return {s.id: [_price(1)] if s.id <= 5 else [_http(403)] for s in searches}
+
+        _run_cycle(searches, partial(), bot=bot)
+
+        assert scheduler._admin_alert_sent is True                 # lo scraper NON e' "recuperato"
+        assert sorted(scheduler._consecutive_failures) == [6, 7, 8, 9, 10]
+        assert bot.send_message.await_count == 1
+        for _ in range(3):
+            _run_cycle(searches, partial(), bot=bot)
+        assert bot.send_message.await_count == 1                   # ancora nessun nuovo alert
+
+    def test_full_recovery_resets_and_a_new_streak_alerts_again(self):
+        bot = _bot()
+        searches = [_search(1), _search(2)]
+        for _ in range(3):
+            _failing_cycle(searches, bot)
+        assert bot.send_message.await_count == 1 and scheduler._admin_alert_sent is True
+
+        _run_cycle(searches, {1: [_price(1)], 2: [None]}, bot=bot)    # tutte rispondono (anche "nessun volo")
+
+        assert scheduler._admin_alert_sent is False
+        assert scheduler._consecutive_failures == {}
+        for _ in range(2):
+            _failing_cycle(searches, bot)
+        assert bot.send_message.await_count == 1                   # nuova serie: ancora sotto soglia
+        _failing_cycle(searches, bot)
+        assert bot.send_message.await_count == 2                   # 3° della nuova serie
+
+    def test_expired_chronic_search_does_not_block_the_recovery(self):
+        """Una ricerca in errore persistente che scade/viene disattivata non tiene l'allarme acceso."""
+        bot = _bot()
+        stuck, healthy = _search(1), _search(2)
+        for _ in range(3):
+            _run_cycle([stuck, healthy], {1: [_http(403)], 2: [_price(1)]}, bot=bot)
+        assert scheduler._admin_alert_sent is True
+
+        _run_cycle([healthy], {2: [_price(1)]}, bot=bot)           # la ricerca 1 non e' piu' attiva
+
+        assert scheduler._admin_alert_sent is False
+
+    def test_alert_is_sent_at_the_end_of_the_cycle_after_every_search(self):
+        events = []
+        bot = _bot()
+        bot.send_message.side_effect = lambda **kwargs: events.append(("alert",))
+        searches = [_search(1), _search(2), _search(3)]
+        scheduler._consecutive_failures[1] = 2                     # al 3° fallimento: soglia
+
+        cycle = _run_cycle(searches, {1: [_http(403)], 2: [_price(2)], 3: [_price(3)]},
+                           bot=bot, events=events)
+
+        assert events.count(("alert",)) == 1
+        assert events[-1] == ("alert",)                            # dopo l'ultimo scraping e commit
+        assert cycle.scrapes == [1, 2, 3]
+        assert sorted(_snapshot_ids(cycle)) == [2, 3]              # le altre ricerche proseguono comunque
+
+    def test_alert_text_has_only_appropriate_information(self):
+        bot = _bot()
+        error = _error(f"Google ha risposto con un errore (FlightsNotFound / errorHasStatus: "
+                       f"{TECH_SECRET})", cause=FlightsNotFound(TECH_SECRET))
+        searches = [_search(1), _search(2, origin="CAG", destination="PSA")]
+        for _ in range(3):
+            _run_cycle(searches, {1: [error], 2: [error]}, bot=bot)
+
+        text = bot.send_message.await_args.kwargs["text"]
+        assert text.startswith("⚠️ Scraper Google Flights")
+        assert "2 ricerche hanno fallito almeno 3 controlli consecutivi." in text
+        assert "PSA → CAG (1)" in text and "CAG → PSA (1)" in text
+        assert text.endswith("Il monitoraggio continua automaticamente.")
+        for forbidden in ("ScraperError", "FlightsNotFound", "errorHasStatus", "Traceback",
+                          "HTTP", "primp", "timeout", "search_id", "Exception", TECH_SECRET):
+            assert forbidden.lower() not in text.lower(), forbidden
+
+    def test_technical_details_stay_in_the_logs(self, caplog):
+        bot = _bot()
+        error = _error(f"errore {TECH_SECRET}", cause=FlightsNotFound(TECH_SECRET))
+
+        with caplog.at_level(logging.INFO, logger="flight_bot.scheduler"):
+            for _ in range(3):
+                _run_cycle([_search(1)], {1: [error]}, bot=bot)
+
+        assert TECH_SECRET in caplog.text
+        assert TECH_SECRET not in bot.send_message.await_args.kwargs["text"]
+
+    def test_text_for_a_single_search_uses_the_singular(self):
+        text = scheduler._admin_alert_text([_search(1)])
+
+        assert "1 ricerca ha fallito almeno 3 controlli consecutivi." in text
+        assert "PSA → CAG (1)" in text
+
+    def test_route_summary_is_sorted_by_count_and_capped(self):
+        searches = [_search(i, origin="PSA", destination="CAG") for i in range(1, 6)]       # 5
+        searches += [_search(i, origin="CAG", destination="PSA") for i in range(6, 9)]      # 3
+        for n, (o, d) in enumerate([("AAA", "BBB"), ("CCC", "DDD"), ("EEE", "FFF"),
+                                    ("GGG", "HHH")], start=9):                              # 1 ciascuna
+            searches.append(_search(n, origin=o, destination=d))
+
+        text = scheduler._admin_alert_text(searches)
+
+        assert "12 ricerche hanno fallito" in text
+        assert text.index("PSA → CAG (5)") < text.index("CAG → PSA (3)")
+        assert text.count("→") == 5                                 # al massimo 5 rotte elencate
+        assert "e altre 1 rotte" in text                            # 6 rotte distinte: 1 omessa
+
+    def test_alert_send_failure_does_not_break_the_cycle_and_is_retried(self, caplog):
+        bot = MagicMock(send_message=AsyncMock(side_effect=RuntimeError("telegram giu'")))
+        searches = [_search(1), _search(2)]
+        scheduler._consecutive_failures[1] = 2
+
+        with caplog.at_level(logging.INFO, logger="flight_bot.scheduler"):
+            cycle = _run_cycle(searches, {1: [_http(403)], 2: [_price(9)]}, bot=bot)
+
+        bot.send_message.assert_awaited_once()                      # tentato
+        assert _snapshot_ids(cycle) == [2]                          # il ciclo e' stato completato
+        assert scheduler._admin_alert_sent is False                 # NON risulta inviato...
+        assert any("alert amministrativo" in r.getMessage() and r.exc_info
+                   for r in caplog.records if r.levelno >= logging.ERROR)
+
+        bot.send_message.side_effect = None                         # ...Telegram torna su
+        _run_cycle(searches, {1: [_http(403)], 2: [_price(9)]}, bot=bot)
+        assert bot.send_message.await_count == 2                    # riprovato al ciclo dopo
+        assert scheduler._admin_alert_sent is True
+        _run_cycle(searches, {1: [_http(403)], 2: [_price(9)]}, bot=bot)
+        assert bot.send_message.await_count == 2                    # poi niente duplicati
+
+    def test_no_searches_at_all_resets_the_state(self):
+        scheduler._admin_alert_sent = True
+
+        _run_cycle([], {})
+
+        assert scheduler._admin_alert_sent is False
+
+
+# ------------------------------------------------------------- 6. sessione DB ----
+
+class TestDatabaseSession:
+
+    def test_transaction_is_released_after_loading_and_before_every_wait(self):
+        searches = [_search(1), _search(2)]
+
+        cycle = _run_cycle(searches, {1: [_timeout()] * 3, 2: [_price(5)]})
+
+        events = cycle.events
+        assert events[0] == ("commit",)                              # subito dopo il caricamento
+        for index, event in enumerate(events):
+            if event[0] == "sleep":
+                assert events[index - 1] == ("commit",), "attesa con transazione aperta"
+        assert [e[0] for e in events].count("sleep") == 2
+
+    def test_real_orm_no_connection_is_held_while_scraping_or_waiting(self, tmp_path):
+        """ORM e pool veri (SQLite su file): durante lo scraping e le attese nessuna connessione in uso."""
+        engine = create_engine(f"sqlite:///{tmp_path / 'cycle.db'}", pool_pre_ping=True)
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine, expire_on_commit=False)      # come db.py
+        with Session() as setup:
+            for i in (1, 2):
+                setup.add(MonitoredSearch(
+                    origin="PSA", destination="CAG",
+                    departure_date=datetime.now() + timedelta(days=30 + i),
+                    return_date=datetime.now() + timedelta(days=32 + i),
+                    monitor_type=MonitorType.MANUAL, telegram_topic_id=7, active=True))
+            setup.commit()
+            ids = [s.id for s in setup.query(MonitoredSearch).order_by(MonitoredSearch.id)]
+
+        in_use = {"scrape": [], "wait": []}
+        script = {ids[0]: [_timeout(), _price(70.0)], ids[1]: [_timeout()] * 3}
+        attempts = collections.Counter()
+
+        def scrape(origin, destination, departure_date, return_date=None, **kwargs):
+            in_use["scrape"].append(engine.pool.checkedout())
+            with Session() as peek:                                      # identifica la ricerca
+                search_id = peek.query(MonitoredSearch.id).filter_by(
+                    departure_date=departure_date).scalar()
+            attempts[search_id] += 1
+            outcome = script[search_id][attempts[search_id] - 1]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        async def fake_sleep(seconds):
+            in_use["wait"].append(engine.pool.checkedout())
+
+        with patch.object(scheduler, "SessionLocal", Session), \
+             patch.object(scheduler, "Bot", return_value=_bot()), \
+             patch.object(scheduler, "_sleep", new=fake_sleep), \
+             patch.object(scheduler, "scrape_google", side_effect=scrape), \
+             patch.object(scheduler, "maybe_send_alert", AsyncMock()):
+            asyncio.run(scheduler.run_scraping_cycle())
+
+        assert len(in_use["scrape"]) == 5 and len(in_use["wait"]) == 2
+        assert set(in_use["scrape"]) == {0}, in_use                       # mai una connessione trattenuta
+        assert set(in_use["wait"]) == {0}, in_use
+        assert engine.pool.checkedout() == 0                               # e a fine ciclo
+        with Session() as check:                                          # i dati veri sono stati salvati
+            snapshots = check.query(PriceSnapshot).all()
+            assert [(s.search_id, s.price_eur) for s in snapshots] == [(ids[0], 70.0)]
+        assert scheduler._consecutive_failures == {ids[1]: 1}
+        engine.dispose()
+
+    def test_real_orm_aggregated_alert_over_several_cycles(self, tmp_path):
+        engine = create_engine(f"sqlite:///{tmp_path / 'alert.db'}")
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine, expire_on_commit=False)
+        with Session() as setup:
+            for i in range(1, 7):
+                setup.add(MonitoredSearch(
+                    origin="PSA" if i <= 4 else "CAG", destination="CAG" if i <= 4 else "PSA",
+                    departure_date=datetime.now() + timedelta(days=30 + i), return_date=None,
+                    monitor_type=MonitorType.MANUAL, telegram_topic_id=7, active=True))
+            setup.commit()
+        bot = _bot()
+
+        def scrape(*args, **kwargs):
+            raise _http(503)
+
+        for _ in range(4):
+            with patch.object(scheduler, "SessionLocal", Session), \
+                 patch.object(scheduler, "Bot", return_value=bot), \
+                 patch.object(scheduler, "_sleep", new=AsyncMock()), \
+                 patch.object(scheduler, "scrape_google", side_effect=scrape), \
+                 patch.object(scheduler, "maybe_send_alert", AsyncMock()):
+                asyncio.run(scheduler.run_scraping_cycle())
+
+        assert bot.send_message.await_count == 1
+        text = bot.send_message.await_args.kwargs["text"]
+        assert "6 ricerche hanno fallito" in text
+        assert "PSA → CAG (4)" in text and "CAG → PSA (2)" in text
+        engine.dispose()
+
+
+# ------------------------------------------------------------- 7. event loop ----
+
+class TestEventLoopStaysResponsive:
+
+    def test_a_concurrent_task_keeps_running_during_the_backoff(self):
+        """L'attesa del backoff cede il controllo all'event loop: il bot continua a rispondere."""
         yields = 5
         waits = []
 
@@ -576,14 +975,15 @@ class TestSchedulerCycleWithRetry:
                     await asyncio.sleep(0)
 
             task = asyncio.create_task(heartbeat())
+            searches = [_search(1)]
             session = MagicMock()
-            session.query.return_value.filter_by.return_value.all.return_value = [_search(1)]
+            session.query.return_value.filter_by.return_value.all.return_value = searches
+            scrape, _ = _scripted_scrape(searches, {1: [_timeout(), _price(1)]}, [])
             with patch.object(scheduler, "SessionLocal", return_value=session), \
                  patch.object(scheduler, "Bot"), \
                  patch.object(scheduler, "_sleep", new=cooperative_wait), \
                  patch.object(scheduler.random, "uniform", return_value=1.0), \
-                 patch.object(scheduler, "scrape_google",
-                              side_effect=_scrape_sequence([_timeout(), _price(1.0)])), \
+                 patch.object(scheduler, "scrape_google", side_effect=scrape), \
                  patch.object(scheduler, "maybe_send_alert", AsyncMock()):
                 await scheduler.run_scraping_cycle()
             task.cancel()
@@ -594,167 +994,7 @@ class TestSchedulerCycleWithRetry:
         assert waits == [pytest.approx(60.0)]
         assert beats >= yields                       # il heartbeat e' avanzato durante l'attesa
 
-
-# ----------------------------------------------------------- 6. alert amministrativo ----
-
-TECH_SECRET = "SECRET-TECH-DETAIL-98765"
-
-
-def _failing_cycle(bot, searches=None, error_factory=None):
-    searches = searches or [_search(1)]
-    factory = error_factory or (lambda: _http(403))
-    return _run_cycle(searches, [[factory()] for _ in searches], bot=bot)
-
-
-class TestAdminAlert:
-
-    def _bot(self):
-        return MagicMock(send_message=AsyncMock())
-
-    def test_no_alert_on_the_first_and_second_failure(self):
-        bot = self._bot()
-
-        _failing_cycle(bot)
-        _failing_cycle(bot)
-
-        bot.send_message.assert_not_awaited()
-        assert scheduler._consecutive_failures == {1: 2}
-
-    def test_alert_on_the_third_consecutive_failure(self):
-        bot = self._bot()
-
-        for _ in range(3):
-            _failing_cycle(bot)
-
-        bot.send_message.assert_awaited_once()
-        kwargs = bot.send_message.await_args.kwargs
-        assert kwargs["chat_id"] == scheduler.TELEGRAM_CHAT_ID == 1
-        assert kwargs["message_thread_id"] == 101           # topic della ricerca
-
-    def test_no_duplicate_alerts_from_the_fourth_failure_on(self):
-        bot = self._bot()
-
-        for _ in range(7):
-            _failing_cycle(bot)
-
-        assert bot.send_message.await_count == 1
-        assert scheduler._consecutive_failures == {1: 7}
-
-    def test_success_resets_and_a_new_streak_alerts_again(self):
-        bot = self._bot()
-        for _ in range(3):
-            _failing_cycle(bot)
-        assert bot.send_message.await_count == 1
-
-        _run_cycle([_search(1)], [[_price(10.0)]], bot=bot)       # la ricerca torna a funzionare
-        for _ in range(2):
-            _failing_cycle(bot)
-        assert bot.send_message.await_count == 1                  # serie nuova: ancora a 2
-
-        _failing_cycle(bot)
-        assert bot.send_message.await_count == 2                  # 3° della nuova serie
-
-    def test_alert_text_has_only_appropriate_information(self):
-        bot = self._bot()
-        error = _scraper_error(
-            f"Google ha risposto con un errore (FlightsNotFound / errorHasStatus: {TECH_SECRET})",
-            FlightsNotFound(TECH_SECRET))
-        # errore NON ritentabile e con testo tecnico "riconoscibile"
-        for _ in range(3):
-            _run_cycle([_search(1)], [[error]], bot=bot)
-
-        text = bot.send_message.await_args.kwargs["text"]
-        assert text.startswith("⚠️ Scraper Google Flights")
-        assert "3 controlli consecutivi falliti" in text
-        assert "PSA → CAG" in text
-        assert _search(1).departure_date.strftime("%d/%m/%Y") in text
-        assert "Il monitoraggio continua automaticamente." in text
-        for forbidden in ("ScraperError", "FlightsNotFound", "errorHasStatus", "Traceback",
-                          "HTTP", "primp", "timeout", "search_id", TECH_SECRET, "Exception"):
-            assert forbidden.lower() not in text.lower(), forbidden
-
-    def test_technical_details_stay_in_the_logs(self, caplog):
-        bot = self._bot()
-        error = _scraper_error(f"errore {TECH_SECRET}", FlightsNotFound(TECH_SECRET))
-
-        with caplog.at_level(logging.INFO, logger="flight_bot.scheduler"):
-            for _ in range(3):
-                _run_cycle([_search(1)], [[error]], bot=bot)
-
-        assert TECH_SECRET in caplog.text                  # dettaglio completo nel log
-        assert TECH_SECRET not in bot.send_message.await_args.kwargs["text"]
-
-    def test_round_trip_dates_are_shown_in_the_alert(self):
-        bot = self._bot()
-        for _ in range(3):
-            _failing_cycle(bot)
-
-        text = bot.send_message.await_args.kwargs["text"]
-        s = _search(1)
-        assert f"({s.departure_date:%d/%m/%Y} - {s.return_date:%d/%m/%Y})" in text
-
-    def test_one_way_search_shows_only_the_departure_date(self):
-        bot = self._bot()
-        one_way = _search(1)
-        one_way.return_date = None
-        for _ in range(3):
-            _run_cycle([one_way], [[_http(403)]], bot=bot)
-
-        text = bot.send_message.await_args.kwargs["text"]
-        assert f"({one_way.departure_date:%d/%m/%Y})." in text
-
-    def test_each_search_alerts_on_its_own_counter(self):
-        bot = self._bot()
-        a, b = _search(1), _search(2)
-
-        for i in range(3):
-            # B fallisce solo nei primi 2 cicli, poi recupera
-            b_outcome = [_http(403)] if i < 2 else [_price(5.0)]
-            _run_cycle([a, b], [[_http(403)], b_outcome], bot=bot)
-
-        assert bot.send_message.await_count == 1
-        assert bot.send_message.await_args.kwargs["message_thread_id"] == 101   # solo la ricerca A
-        assert scheduler._consecutive_failures == {1: 3}
-
-    def test_retries_alone_never_trigger_an_alert(self):
-        bot = self._bot()
-
-        _run_cycle([_search(1)], [[_timeout()] * 3], bot=bot)    # 3 tentativi, 1 solo fallimento
-
-        bot.send_message.assert_not_awaited()
-
-    def test_alert_failure_does_not_break_the_cycle(self, caplog):
-        bot = MagicMock(send_message=AsyncMock(side_effect=RuntimeError("telegram giu'")))
-        scheduler._consecutive_failures[1] = 2
-        searches = [_search(1), _search(2)]
-
-        with caplog.at_level(logging.INFO, logger="flight_bot.scheduler"):
-            session, price_alert, _, _ = _run_cycle(
-                searches, [[_http(403)], [_price(9.0)]], bot=bot)
-
-        bot.send_message.assert_awaited_once()                 # tentato una volta
-        assert _snapshot_ids(session) == [2]                   # la ricerca 2 prosegue
-        assert _price_alert_ids(price_alert) == [2]
-        assert any("alert amministrativo" in r.getMessage() and r.exc_info
-                   for r in caplog.records if r.levelno >= logging.ERROR)
-
-    def test_failing_search_does_not_stop_the_cycle_at_the_alert_threshold(self):
-        bot = self._bot()
-        scheduler._consecutive_failures[1] = 2
-
-        session, price_alert, _, _ = _run_cycle(
-            [_search(1), _search(2)], [[_http(403)], [_price(7.0)]], bot=bot)
-
-        bot.send_message.assert_awaited_once()
-        assert _snapshot_ids(session) == [2]
-        assert _price_alert_ids(price_alert) == [2]
-
-    def test_no_price_alert_or_snapshot_for_the_failing_search(self):
-        bot = self._bot()
-        scheduler._consecutive_failures[1] = 2
-
-        session, price_alert, _, _ = _run_cycle([_search(1)], [[_http(403)]], bot=bot)
-
-        bot.send_message.assert_awaited_once()                 # alert amministrativo...
-        session.add.assert_not_called()                        # ...ma nessun dato falso
-        price_alert.assert_not_called()                        # ...e nessun alert di prezzo
+    def test_the_wait_is_never_a_blocking_sleep(self):
+        """`_sleep` e' una coroutine e il modulo non usa time.sleep (guardia anche in conftest)."""
+        assert asyncio.iscoroutinefunction(scheduler._sleep)
+        assert "time.sleep" not in inspect.getsource(scheduler)

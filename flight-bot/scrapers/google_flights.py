@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from primp import Client, PrimpError
+from primp import TimeoutError as PrimpTimeoutError
 from selectolax.lexbor import LexborHTMLParser
 from fast_flights import FlightQuery, Passengers, create_filter
 from fast_flights.parser import parse
@@ -84,7 +85,20 @@ class ScraperError(RuntimeError):
     search_options. Estende RuntimeError perche' il codice di consenso
     sollevava gia' RuntimeError. L'eccezione originale e' sempre disponibile
     in `__cause__`.
+
+    Due attributi opzionali dicono, senza che il chiamante debba conoscere i
+    dettagli di primp, SE l'errore e' di tipo temporaneo:
+      status_code : status HTTP della risposta (int), se l'errore e' HTTP 4xx/5xx
+      timed_out   : True se la richiesta e' scaduta (timeout)
+    Valgono None / False in tutti gli altri casi (parser, consenso strutturale,
+    FlightsNotFound, errori di connessione...).
     """
+
+    def __init__(self, message: str = "", *, status_code: int | None = None,
+                 timed_out: bool = False):
+        super().__init__(message)
+        self.status_code = status_code
+        self.timed_out = timed_out
 
 
 def _request(method: str, url: str, **kwargs):
@@ -99,14 +113,17 @@ def _request(method: str, url: str, **kwargs):
         response = getattr(_client, method)(url, timeout=HTTP_TIMEOUT_SECONDS, **kwargs)
     except PrimpError as exc:
         raise ScraperError(
-            f"Richiesta {method.upper()} a Google fallita ({type(exc).__name__})"
+            f"Richiesta {method.upper()} a Google fallita ({type(exc).__name__})",
+            timed_out=isinstance(exc, PrimpTimeoutError),    # include DNSTimeoutError
         ) from exc
     try:
         response.raise_for_status()
     except PrimpError as exc:
+        status = getattr(response, "status_code", None)
         raise ScraperError(
             f"Google ha risposto con errore HTTP "
-            f"{getattr(response, 'status_code', '?')} alla richiesta {method.upper()}"
+            f"{getattr(response, 'status_code', '?')} alla richiesta {method.upper()}",
+            status_code=status if isinstance(status, int) else None,
         ) from exc
     return response
 

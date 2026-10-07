@@ -43,6 +43,7 @@ def _reset_scheduler_failure_state():
         module = sys.modules.get("scheduler")
         if module is not None:
             module._consecutive_failures.clear()
+            module._admin_alert_sent = False
     _clear()
     yield
     _clear()

@@ -757,3 +757,132 @@ class TestScraperErrorFromFlightsNotFoundPropagates:
 
         assert excinfo.value is error
         assert excinfo.value.__cause__ is original
+
+
+# --------------------------------- attributi strutturati di ScraperError (status/timeout) ---
+
+class TestScraperErrorStructuredAttributes:
+    """
+    ScraperError espone `status_code` (HTTP) e `timed_out` (timeout) cosi' che il
+    chiamante decida i retry senza conoscere i dettagli di primp. Valgono None / False
+    in tutti gli altri casi.
+    """
+
+    def test_defaults_and_backward_compatibility(self):
+        error = ScraperError("errore generico")
+
+        assert error.status_code is None and error.timed_out is False
+        assert str(error) == "errore generico" and error.args == ("errore generico",)
+        assert isinstance(error, RuntimeError)
+        assert str(ScraperError()) == ""
+
+    def test_attributes_are_keyword_only(self):
+        with pytest.raises(TypeError):
+            ScraperError("errore", 503)
+
+    @pytest.mark.parametrize("error", [
+        primp.TimeoutError("operation timed out"),
+        primp.DNSTimeoutError("dns timed out"),
+    ], ids=lambda e: type(e).__name__)
+    @pytest.mark.parametrize("method", ["get", "post"])
+    @patch("scrapers.google_flights._client")
+    def test_timeout_sets_timed_out(self, mock_client, error, method):
+        getattr(mock_client, method).side_effect = error
+
+        with pytest.raises(ScraperError) as excinfo:
+            _request(method, "https://example.test/x")
+
+        assert excinfo.value.timed_out is True
+        assert excinfo.value.status_code is None
+
+    @pytest.mark.parametrize("error", [
+        primp.ConnectError("connection refused"), primp.DNSError("name not resolved"),
+    ], ids=lambda e: type(e).__name__)
+    @patch("scrapers.google_flights._client")
+    def test_other_network_errors_are_not_timeouts(self, mock_client, error):
+        mock_client.get.side_effect = error
+
+        with pytest.raises(ScraperError) as excinfo:
+            _request("get", "https://example.test/x")
+
+        assert excinfo.value.timed_out is False
+        assert excinfo.value.status_code is None
+
+    @pytest.mark.parametrize("status", [400, 403, 404, 429, 500, 502, 503, 504])
+    @patch("scrapers.google_flights._client")
+    def test_http_error_sets_status_code(self, mock_client, status):
+        mock_client.get.return_value = _response(text="<html>err</html>", status=status)
+
+        with pytest.raises(ScraperError) as excinfo:
+            _request("get", "https://example.test/x")
+
+        assert excinfo.value.status_code == status
+        assert excinfo.value.timed_out is False
+        assert str(status) in str(excinfo.value)             # messaggio invariato
+
+    @patch("scrapers.google_flights._client")
+    def test_consent_post_http_error_sets_status_code(self, mock_client):
+        mock_client.post.return_value = _response(text="<html>err</html>", status=500)
+
+        with pytest.raises(ScraperError) as excinfo:
+            _submit_consent_form(CONSENT_HTML)
+
+        assert excinfo.value.status_code == 500
+        assert excinfo.value.timed_out is False
+
+    @patch("scrapers.google_flights._client")
+    def test_non_integer_status_is_ignored(self, mock_client):
+        """status_code non int (es. oggetto inatteso): None, mai un valore falso."""
+        response = Mock()
+        response.status_code = Mock()                        # non e' un int
+        response.raise_for_status.side_effect = primp.StatusError("HTTP error")
+        mock_client.get.return_value = response
+
+        with pytest.raises(ScraperError) as excinfo:
+            _request("get", "https://example.test/x")
+
+        assert excinfo.value.status_code is None
+
+    @patch("scrapers.google_flights._client")
+    def test_response_without_status_code_gives_none(self, mock_client):
+        mock_client.get.return_value = SimpleNamespace(
+            raise_for_status=Mock(side_effect=primp.StatusError("HTTP error")))
+
+        with pytest.raises(ScraperError) as excinfo:
+            _request("get", "https://example.test/x")
+
+        assert excinfo.value.status_code is None and "?" in str(excinfo.value)
+
+    @pytest.mark.parametrize("page,url", [
+        (GOOGLE_ERROR_PAYLOAD_PAGE, "https://www.google.com/travel/flights"),   # FlightsNotFound
+        (UNUSABLE_PAGE, "https://www.google.com/travel/flights"),               # errore del parser
+        ("<html></html>", CONSENT_URL),                                         # consenso senza form
+    ], ids=["flights_not_found", "parser", "consent_structure"])
+    @patch("scrapers.google_flights._client")
+    def test_non_http_errors_carry_no_status_and_no_timeout(self, mock_client, page, url):
+        mock_client.get.return_value = _response(text=page, url=url)
+
+        with pytest.raises(ScraperError) as excinfo:
+            search_leg("PSA", "CAG", DEPARTURE)
+
+        assert excinfo.value.status_code is None
+        assert excinfo.value.timed_out is False
+
+    @pytest.mark.parametrize("call", [
+        lambda: search_leg("PSA", "CAG", DEPARTURE),
+        lambda: scrape_price("PSA", "CAG", DEPARTURE),
+        lambda: scrape_price("PSA", "CAG", DEPARTURE, return_date=RETURN),
+        lambda: search_options("PSA", "CAG", DEPARTURE, return_date=RETURN),
+    ], ids=["search_leg", "scrape_price", "scrape_price_rt", "search_options_rt"])
+    @patch("scrapers.google_flights._client")
+    def test_attributes_reach_the_public_functions_unchanged(self, mock_client, call):
+        mock_client.get.return_value = _response(text="<html>err</html>", status=503)
+        with pytest.raises(ScraperError) as excinfo:
+            call()
+        assert excinfo.value.status_code == 503 and excinfo.value.timed_out is False
+
+        mock_client.get.return_value = None
+        mock_client.get.side_effect = primp.TimeoutError("operation timed out")
+        with pytest.raises(ScraperError) as excinfo:
+            call()
+        assert excinfo.value.timed_out is True and excinfo.value.status_code is None
