@@ -434,19 +434,30 @@ class TestSchedulerOtherErrorsAreNotHidden:
         # (ScraperError estende RuntimeError: un RuntimeError qualsiasi non e' un ScraperError).
         assert "scraper" not in errors[0].getMessage().lower()
 
-    def test_errors_in_the_alert_step_are_not_swallowed(self):
-        """Il boundary per-ricerca copre SOLO lo scraping: un errore negli alert si propaga come prima."""
+    def test_errors_in_the_alert_step_are_isolated_per_search_but_never_hidden(self, caplog):
+        """
+        Contratto AGGIORNATO (F2). Prima un errore negli alert si propagava e interrompeva
+        l'intero ciclo (le ricerche successive andavano perse). Ora e' isolato per ricerca,
+        ma NON nascosto: si registra con la ricerca interessata e il traceback originale.
+        """
+        searches = [_search(1), _search(2)]
         session = MagicMock()
-        session.query.return_value.filter_by.return_value.all.return_value = [_search(1)]
-        alert = AsyncMock(side_effect=ValueError("errore negli alert"))
+        session.query.return_value.filter_by.return_value.all.return_value = searches
+        error = ValueError("errore negli alert")
+        alert = AsyncMock(side_effect=[error, None])        # fallisce solo per la 1ª ricerca
 
         with patch.object(scheduler, "SessionLocal", return_value=session), \
              patch.object(scheduler, "Bot"), \
-             patch.object(scheduler, "scrape_google", side_effect=[_price(50.0)]), \
-             patch.object(scheduler, "maybe_send_alert", alert):
-            with pytest.raises(ValueError, match="errore negli alert"):
-                asyncio.run(scheduler.run_scraping_cycle())
+             patch.object(scheduler, "scrape_google", side_effect=[_price(50.0), _price(60.0)]), \
+             patch.object(scheduler, "maybe_send_alert", alert), \
+             caplog.at_level(logging.INFO, logger="flight_bot.scheduler"):
+            asyncio.run(scheduler.run_scraping_cycle())      # nessuna eccezione
 
+        assert alert.await_count == 2                       # la 2ª ricerca e' stata comunque gestita
+        assert [c.args[0].search_id for c in session.add.call_args_list] == [1, 2]
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1 and "search_id=1" in errors[0].getMessage()
+        assert errors[0].exc_info[1] is error               # traceback dell'errore originale
         session.close.assert_called_once()                  # la sessione si chiude comunque
 
 

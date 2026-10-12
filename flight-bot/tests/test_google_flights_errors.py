@@ -886,3 +886,150 @@ class TestScraperErrorStructuredAttributes:
         with pytest.raises(ScraperError) as excinfo:
             call()
         assert excinfo.value.timed_out is True and excinfo.value.status_code is None
+
+
+# ------------------------------------------ F1: timeout durante la LETTURA del corpo ---
+
+class _LazyBodyResponse:
+    """
+    Risposta come quella di primp: status e header arrivano subito (la richiesta "riesce"),
+    il corpo si legge DOPO e puo' fallire. I mock precedenti restituivano `.text` come
+    stringa e non potevano riprodurre questo caso.
+    """
+
+    def __init__(self, error, url="https://www.google.com/travel/flights", status=200):
+        self._error = error
+        self.url = url
+        self.status_code = status
+
+    def raise_for_status(self):
+        return None
+
+    @property
+    def text(self):
+        raise self._error
+
+
+BODY_TIMEOUTS = [
+    primp.TimeoutError("operation timed out"),
+    primp.DNSTimeoutError("dns timed out"),
+]
+
+
+class TestBodyReadTimeout:
+    """Un timeout che scatta mentre si legge response.text diventa ScraperError(timed_out=True)."""
+
+    @pytest.mark.parametrize("error", BODY_TIMEOUTS, ids=lambda e: type(e).__name__)
+    @patch("scrapers.google_flights._client")
+    def test_timeout_while_reading_the_results_page(self, mock_client, error):
+        mock_client.get.return_value = _LazyBodyResponse(error)
+
+        with pytest.raises(ScraperError) as excinfo:
+            _fetch_html(_query())
+
+        assert excinfo.value.timed_out is True
+        assert excinfo.value.status_code is None
+        assert excinfo.value.__cause__ is error                 # causa originale preservata
+        assert type(error).__name__ in str(excinfo.value)
+
+    @pytest.mark.parametrize("error", BODY_TIMEOUTS, ids=lambda e: type(e).__name__)
+    @patch("scrapers.google_flights._client")
+    def test_timeout_while_reading_the_consent_page(self, mock_client, error):
+        mock_client.get.return_value = _LazyBodyResponse(error, url=CONSENT_URL)
+
+        with pytest.raises(ScraperError) as excinfo:
+            _fetch_html(_query())
+
+        assert excinfo.value.timed_out is True and excinfo.value.__cause__ is error
+        mock_client.post.assert_not_called()                    # il form non e' stato nemmeno letto
+
+    @pytest.mark.parametrize("error", BODY_TIMEOUTS, ids=lambda e: type(e).__name__)
+    @patch("scrapers.google_flights._client")
+    def test_timeout_while_reading_the_consent_post_response(self, mock_client, error):
+        mock_client.post.return_value = _LazyBodyResponse(error)
+
+        with pytest.raises(ScraperError) as excinfo:
+            _submit_consent_form(CONSENT_HTML)
+
+        assert excinfo.value.timed_out is True
+        assert excinfo.value.status_code is None
+        assert excinfo.value.__cause__ is error
+
+    @patch("scrapers.google_flights._client")
+    def test_consent_flow_end_to_end_reports_the_body_timeout(self, mock_client):
+        """GET -> redirect al consenso (corpo ok) -> POST la cui risposta va in timeout nel corpo."""
+        error = primp.TimeoutError("operation timed out")
+        mock_client.get.return_value = _response(text=CONSENT_HTML, url=CONSENT_URL)
+        mock_client.post.return_value = _LazyBodyResponse(error)
+
+        with pytest.raises(ScraperError) as excinfo:
+            _fetch_html(_query())
+
+        assert excinfo.value.timed_out is True and excinfo.value.__cause__ is error
+
+    @pytest.mark.parametrize("call", [
+        lambda: search_leg("PSA", "CAG", DEPARTURE),
+        lambda: scrape_price("PSA", "CAG", DEPARTURE),
+        lambda: scrape_price("PSA", "CAG", DEPARTURE, return_date=RETURN),
+        lambda: search_options("PSA", "CAG", DEPARTURE),
+        lambda: search_options("PSA", "CAG", DEPARTURE, return_date=RETURN),
+    ], ids=["search_leg", "scrape_price", "scrape_price_rt", "search_options", "search_options_rt"])
+    @patch("scrapers.google_flights._client")
+    def test_body_timeout_reaches_every_public_function_as_a_timeout(self, mock_client, call):
+        """Non deve piu' diventare un errore generico "analisi fallita" con timed_out=False."""
+        error = primp.TimeoutError("operation timed out")
+        mock_client.get.return_value = _LazyBodyResponse(error)
+
+        with pytest.raises(ScraperError) as excinfo:
+            call()
+
+        assert excinfo.value.timed_out is True
+        assert excinfo.value.__cause__ is error
+        assert "analisi" not in str(excinfo.value).lower()
+
+    @patch("scrapers.google_flights._client")
+    def test_successful_body_read_is_unchanged(self, mock_client):
+        mock_client.get.return_value = _response(text="<html>voli</html>")
+
+        assert _fetch_html(_query()) == "<html>voli</html>"
+
+    def test_body_is_only_read_inside_the_protected_helper(self):
+        """
+        Guardia strutturale: `response.text` compare in UN solo punto (dentro
+        _response_text). Se tornasse fuori, un timeout nel corpo sfuggirebbe alla
+        normalizzazione e non verrebbe piu' ritentato.
+        """
+        import inspect
+        import scrapers.google_flights as module
+
+        assert inspect.getsource(module).count("response.text") == 1
+        assert "response.text" in inspect.getsource(module._response_text)
+
+
+class TestBodyReadErrorsThatAreNotTimeouts:
+    """
+    FUORI SCOPE di F1: nessuna nuova policy per corpo troncato / errori di decoding. Il loro
+    comportamento resta quello di prima (errore generico NON ritentabile): qui solo
+    documentato e fissato, non deciso.
+    """
+
+    @patch("scrapers.google_flights._client")
+    def test_decode_error_is_not_normalized_by_the_helper(self, mock_client):
+        error = primp.DecodeError("error decoding response body")
+        mock_client.get.return_value = _LazyBodyResponse(error)
+
+        with pytest.raises(primp.DecodeError) as excinfo:       # grezzo, come prima
+            _fetch_html(_query())
+
+        assert excinfo.value is error
+
+    @patch("scrapers.google_flights._client")
+    def test_decode_error_through_search_leg_is_still_a_generic_non_timeout_error(self, mock_client):
+        error = primp.DecodeError("error decoding response body")
+        mock_client.get.return_value = _LazyBodyResponse(error)
+
+        with pytest.raises(ScraperError) as excinfo:
+            search_leg("PSA", "CAG", DEPARTURE)
+
+        assert excinfo.value.timed_out is False and excinfo.value.status_code is None
+        assert excinfo.value.__cause__ is error

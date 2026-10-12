@@ -137,6 +137,25 @@ class LegOption:
     stops: int  # 0 = diretto
 
 
+def _response_text(response) -> str:
+    """
+    Legge il corpo della risposta. primp lo legge in modo pigro: un TIMEOUT puo' scattare
+    proprio qui, dopo che _request() e' gia' tornata. Senza questa normalizzazione
+    uscirebbe come errore grezzo e search_leg lo avvolgerebbe in un ScraperError generico
+    (timed_out=False), quindi non ritentabile.
+
+    Solo i timeout vengono normalizzati. Gli altri errori di lettura (es. DecodeError per
+    un corpo troncato) NON si toccano: la loro classificazione resta quella di prima.
+    """
+    try:
+        return response.text
+    except PrimpTimeoutError as exc:             # include DNSTimeoutError
+        raise ScraperError(
+            f"Lettura della risposta di Google fallita ({type(exc).__name__})",
+            timed_out=True,
+        ) from exc
+
+
 def _submit_consent_form(consent_html: str) -> str:
     """
     Trova il modulo di accettazione nella pagina di consenso EU e lo invia via
@@ -173,16 +192,16 @@ def _submit_consent_form(consent_html: str) -> str:
             campi[nome] = inp.attributes.get("value", "")
 
     response = _request("post", action, data=campi)
-    return response.text
+    return _response_text(response)
 
 
 def _fetch_html(query) -> str:
     response = _request("get", GOOGLE_FLIGHTS_URL, params=query.params())
 
     if "consent.google.com" in response.url:
-        return _submit_consent_form(response.text)
+        return _submit_consent_form(_response_text(response))
 
-    return response.text
+    return _response_text(response)
 
 
 def _format_time(time_tuple: tuple[int, int] | None) -> str | None:

@@ -131,7 +131,7 @@ def _admin_alert_text(chronic: list[MonitoredSearch]) -> str:
     )
 
 
-async def _send_admin_alert(bot: Bot, chronic: list[MonitoredSearch]) -> bool:
+async def _send_admin_alert(bot: Bot, text: str, searches_count: int) -> bool:
     """
     Invia l'alert amministrativo aggregato (best effort). Ritorna True se inviato.
     Un errore nell'invio non interrompe il ciclo: si registra nei log e si riprovera' al
@@ -139,27 +139,58 @@ async def _send_admin_alert(bot: Bot, chronic: list[MonitoredSearch]) -> bool:
     gruppi con topic il messaggio va nel topic generale.
     """
     try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=_admin_alert_text(chronic))
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
     except Exception:
         logger.exception("Invio dell'alert amministrativo fallito (%d ricerche in errore)",
-                         len(chronic))
+                         searches_count)
         return False
     return True
 
 
-async def _update_admin_alert(bot: Bot, searches: list[MonitoredSearch]) -> None:
+async def _update_admin_alert(session, bot: Bot, searches_by_id: dict) -> None:
     """A fine ciclo: un solo alert aggregato per serie di errori; rilancio solo a recupero completo."""
     global _admin_alert_sent
-    chronic = [s for s in searches
-               if _consecutive_failures.get(s.id, 0) >= ADMIN_ALERT_FAILURE_THRESHOLD]
+    chronic = [searches_by_id[search_id] for search_id, failures in _consecutive_failures.items()
+               if failures >= ADMIN_ALERT_FAILURE_THRESHOLD and search_id in searches_by_id]
     if not chronic:
         _admin_alert_sent = False          # nessuna ricerca in errore persistente: ripristinato
         return
-    if not _admin_alert_sent and await _send_admin_alert(bot, chronic):
+    if _admin_alert_sent:
+        return
+    # Prima si LEGGONO i dati delle ricerche (se gli oggetti sono scaduti dopo un rollback
+    # servono query), poi si rilascia la connessione e SOLO DOPO si fa l'invio lento.
+    text = _admin_alert_text(chronic)
+    _release_connection(session)
+    if await _send_admin_alert(bot, text, len(chronic)):
         _admin_alert_sent = True
 
 
-def _scrape_search(search: MonitoredSearch):
+def _release_connection(session) -> None:
+    """
+    Chiude la transazione aperta, cosi' la connessione torna al pool PRIMA di un'operazione
+    lenta (scraping bloccante, attesa dei retry, invio dell'alert amministrativo). Senza
+    modifiche pendenti e' un commit "a vuoto" (con expire_on_commit=False gli oggetti
+    caricati restano utilizzabili); senza transazione in corso non acquisisce nulla.
+    """
+    session.commit()
+
+
+def _recover_session(session) -> None:
+    """
+    Dopo un errore nel salvataggio di UNA ricerca: se la transazione e' stata invalidata
+    (es. commit fallito) serve un rollback, altrimenti ogni operazione successiva solleva
+    PendingRollbackError e fa fallire a cascata tutte le ricerche seguenti. Se la sessione
+    e' ancora attiva (es. errore di Telegram dopo il commit) non si tocca nulla: un rollback
+    farebbe scadere gli oggetti e li costringerebbe a rileggere dal DB.
+    """
+    try:
+        if not session.is_active:
+            session.rollback()
+    except Exception:
+        logger.exception("Rollback della sessione dopo un errore di salvataggio fallito")
+
+
+def _scrape_search(session, search: MonitoredSearch):
     """UNA chiamata allo scraper per la ricerca (puo' sollevare ScraperError)."""
     # Il filtro sull'orario vale in due casi: i weekend automatici
     # (fascia serale fissa da config) e i monitoraggi nati da /cerca
@@ -179,9 +210,16 @@ def _scrape_search(search: MonitoredSearch):
         latest_return_hour = search.latest_return_hour
         direct_only = False
 
+    # Legge ORA i dati della ricerca (potrebbe servire una rilettura dal DB se l'oggetto e'
+    # scaduto) e SUBITO DOPO rilascia la connessione: la chiamata che segue e' sincrona e
+    # puo' durare decine di secondi, non deve tenere occupata una connessione DB.
+    origin, destination = search.origin, search.destination
+    departure_date, return_date = search.departure_date, search.return_date
+    _release_connection(session)
+
     return scrape_google(
-        search.origin, search.destination,
-        search.departure_date, search.return_date,
+        origin, destination,
+        departure_date, return_date,
         earliest_departure_hour=earliest_departure_hour,
         latest_departure_hour=latest_departure_hour,
         earliest_return_hour=earliest_return_hour,
@@ -231,11 +269,13 @@ async def _run_pass(session, bot: Bot, searches: list[MonitoredSearch]):
       - ScraperError NON ritentabile: fallimento definitivo subito;
       - ScraperError ritentabile: non ancora un fallimento, ritorna (ricerca, errore);
       - qualunque altra eccezione: bug, si logga e si salta (non conta, non si ritenta).
+    Anche il salvataggio/alert di UNA ricerca e' isolato: un errore li' (DB, Telegram) si
+    logga con la ricerca interessata e non interrompe le altre ne' i retry in corso.
     """
     retryable: list[tuple[MonitoredSearch, ScraperError]] = []
     for search in searches:
         try:
-            result = _scrape_search(search)
+            result = _scrape_search(session, search)
         except ScraperError as error:
             # Errore tecnico dello scraper: NON e' "nessun volo". Nessuno snapshot e
             # nessun alert di prezzo per questa ricerca.
@@ -249,7 +289,18 @@ async def _run_pass(session, bot: Bot, searches: list[MonitoredSearch]):
             continue
 
         _record_success(search.id)   # risposta valida (anche "nessun volo"): azzera la serie
-        await _store_result(session, bot, search, result)
+        # Letti ORA, finche' l'oggetto e' caricato: dopo un commit fallito SQLAlchemy fa scadere
+        # tutti gli oggetti e rileggerli su una sessione inattiva solleverebbe PendingRollbackError
+        # proprio nel gestore che deve isolare l'errore.
+        label = (search.id, search.flight_key, search.origin, search.destination)
+        try:
+            await _store_result(session, bot, search, result)
+        except Exception:
+            logger.exception(
+                "Salvataggio del risultato o alert di prezzo fallito per search_id=%s "
+                "(%s, %s -> %s)", *label,
+            )
+            _recover_session(session)
     return retryable
 
 
@@ -261,11 +312,12 @@ async def run_scraping_cycle():
         # Chiude subito la transazione di lettura: la connessione torna al pool e non
         # resta "idle in transaction" durante lo scraping e le attese dei retry.
         # (expire_on_commit=False: gli oggetti caricati restano utilizzabili.)
-        session.commit()
+        _release_connection(session)
 
         # Voli nel passato: da disattivare (pulizia periodica separata), non si controllano.
         to_check = [s for s in active_searches if (s.departure_date - datetime.now()).days >= 0]
-        _forget_stale_failures({s.id for s in to_check})
+        searches_by_id = {s.id: s for s in to_check}      # ids letti ora, a oggetti ancora caricati
+        _forget_stale_failures(set(searches_by_id))
 
         # Primo passaggio su TUTTE le ricerche, poi al massimo 2 passaggi di retry sulle
         # sole ricerche fallite con un errore temporaneo (mai su quelle riuscite).
@@ -279,7 +331,7 @@ async def run_scraping_cycle():
                 len(retryable), len(to_check), retry_index + 1,
                 len(SCRAPE_RETRY_BASE_DELAYS_SECONDS), delay,
             )
-            session.commit()          # nessuna transazione aperta durante l'attesa
+            _release_connection(session)          # nessuna transazione aperta durante l'attesa
             await _sleep(delay)
             retryable = await _run_pass(session, bot, [s for s, _ in retryable])
 
@@ -287,7 +339,7 @@ async def run_scraping_cycle():
         for search, error in retryable:
             _log_definitive_failure(search, error)
 
-        await _update_admin_alert(bot, to_check)
+        await _update_admin_alert(session, bot, searches_by_id)
     finally:
         session.close()
 
