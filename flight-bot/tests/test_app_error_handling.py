@@ -59,13 +59,13 @@ FORBIDDEN_IN_USER_TEXT = (
 )
 
 
-def _scraper_error(message, cause):
+def _scraper_error(message, cause, **attributes):
     """ScraperError REALE sollevata `from cause` (come fa lo scraper), non assemblata a mano."""
     try:
         try:
             raise cause
         except Exception as exc:
-            raise ScraperError(message) from exc
+            raise ScraperError(message, **attributes) from exc
     except ScraperError as err:
         return err
 
@@ -77,10 +77,13 @@ TECHNICAL_ERRORS = {
         FlightsNotFound("no flights found; received error")),
     "http_503": lambda: _scraper_error(
         "Google ha risposto con errore HTTP 503 alla richiesta GET",
-        primp.StatusError("HTTP 503 Service Unavailable")),
+        primp.StatusError(503, "HTTP 503 Service Unavailable for URL: https://example.test/x",
+                          "https://example.test/x"),
+        status_code=503),
     "timeout": lambda: _scraper_error(
         "Richiesta GET a Google fallita (TimeoutError)",
-        primp.TimeoutError("operation timed out")),
+        primp.TimeoutError("operation timed out"),
+        timed_out=True),
     "parser": lambda: _scraper_error(
         "Analisi della pagina Google Flights fallita (AttributeError)",
         AttributeError("'NoneType' object has no attribute 'text'")),
@@ -245,9 +248,10 @@ def _search(search_id, origin="PSA", destination="CAG", monitor_type=MonitorType
         flight_key=f"{origin}{destination}{search_id:04d}",
         origin=origin,
         destination=destination,
-        departure_date=datetime.now() + timedelta(days=30),
-        return_date=datetime.now() + timedelta(days=32),
+        departure_date=datetime.now() + timedelta(days=30 + search_id),   # univoca per ricerca
+        return_date=datetime.now() + timedelta(days=32 + search_id),
         monitor_type=monitor_type,
+        telegram_topic_id=100 + search_id,
         earliest_departure_hour=None,
         latest_departure_hour=None,
         earliest_return_hour=None,
@@ -265,19 +269,47 @@ def _price(price):
 
 def _run_cycle(searches, scrape_results):
     """
-    Esegue scheduler.run_scraping_cycle con DB, Bot, scraper e alert mockati.
-    `scrape_results`: lista di valori/eccezioni restituiti/sollevati, uno per ricerca.
+    Esegue scheduler.run_scraping_cycle con DB, Bot, scraper, alert e ATTESE mockati.
+    `scrape_results`: un valore/eccezione per ricerca (stessa posizione di `searches`);
+    l'esito vale per OGNI tentativo di quella ricerca (anche se lo scheduler ritenta).
     Ritorna (session, scrape_mock, alert_mock).
     """
     session = MagicMock()
     session.query.return_value.filter_by.return_value.all.return_value = searches
     alert = AsyncMock()
+    outcome_by_departure = {s.departure_date: r for s, r in zip(searches, scrape_results)}
+
+    def scrape_outcome(origin, destination, departure_date, return_date=None, **kwargs):
+        outcome = outcome_by_departure[departure_date]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
     with patch.object(scheduler, "SessionLocal", return_value=session), \
          patch.object(scheduler, "Bot"), \
-         patch.object(scheduler, "scrape_google", side_effect=scrape_results) as scrape, \
+         patch.object(scheduler, "_sleep", new=AsyncMock()), \
+         patch.object(scheduler, "scrape_google", side_effect=scrape_outcome) as scrape, \
          patch.object(scheduler, "maybe_send_alert", alert):
         asyncio.run(scheduler.run_scraping_cycle())
     return session, scrape, alert
+
+
+def _snapshot_commits(session):
+    """
+    Quanti snapshot sono stati salvati: ogni `add` deve essere seguito SUBITO da un
+    `commit` (il ciclo fa anche altri commit senza dati: rilascio della transazione).
+    """
+    names = [call[0] for call in session.mock_calls]
+    for i, name in enumerate(names):
+        if name == "add":
+            assert names[i + 1] == "commit", "snapshot aggiunto ma non committato"
+    return sum(1 for i, name in enumerate(names) if name == "commit" and names[i - 1] == "add")
+
+
+def _attempted_search_ids(scrape, searches):
+    """Id delle ricerche per cui lo scraper e' stato chiamato almeno una volta (retry inclusi)."""
+    by_departure = {s.departure_date: s.id for s in searches}
+    return {by_departure[call.args[2]] for call in scrape.call_args_list}
 
 
 def _snapshots(session):
@@ -296,28 +328,30 @@ class TestSchedulerScraperError:
 
         session, scrape, alert = _run_cycle(searches, [_price(50.0), technical_error, _price(60.0)])
 
-        assert scrape.call_count == 3                       # la terza ricerca viene eseguita
+        assert _attempted_search_ids(scrape, searches) == {1, 2, 3}   # la terza ricerca viene eseguita
         snapshots = _snapshots(session)
         assert [(s.search_id, s.price_eur) for s in snapshots] == [(1, 50.0), (3, 60.0)]
         assert all(isinstance(s, PriceSnapshot) for s in snapshots)
-        assert session.commit.call_count == 2
+        assert _snapshot_commits(session) == 2
         assert _alerted_search_ids(alert) == [1, 3]
         session.close.assert_called_once()
 
     def test_error_on_the_first_search_does_not_stop_the_cycle(self, technical_error):
-        session, scrape, alert = _run_cycle([_search(1), _search(2)], [technical_error, _price(70.0)])
+        searches = [_search(1), _search(2)]
+        session, scrape, alert = _run_cycle(searches, [technical_error, _price(70.0)])
 
-        assert scrape.call_count == 2
+        assert _attempted_search_ids(scrape, searches) == {1, 2}
         assert [(s.search_id, s.price_eur) for s in _snapshots(session)] == [(2, 70.0)]
         assert _alerted_search_ids(alert) == [2]
 
     def test_all_searches_failing_creates_no_data_and_sends_no_alert(self, technical_error):
+        searches = [_search(1), _search(2)]
         session, scrape, alert = _run_cycle(
-            [_search(1), _search(2)], [technical_error, TECHNICAL_ERRORS["timeout"]()])
+            searches, [technical_error, TECHNICAL_ERRORS["timeout"]()])
 
-        assert scrape.call_count == 2
+        assert _attempted_search_ids(scrape, searches) == {1, 2}
         session.add.assert_not_called()                     # nessun dato falso
-        session.commit.assert_not_called()
+        assert _snapshot_commits(session) == 0              # nessun commit di dati
         alert.assert_not_called()                           # nessun alert di prezzo
         session.close.assert_called_once()
 
@@ -372,7 +406,8 @@ class TestSchedulerScraperError:
         past = _search(1)
         past.departure_date = datetime.now() - timedelta(days=2)
 
-        session, scrape, alert = _run_cycle([past, _search(2)], [_price(55.0)])
+        # un esito per ricerca; quello della ricerca nel passato non viene mai usato
+        session, scrape, alert = _run_cycle([past, _search(2)], [None, _price(55.0)])
 
         assert scrape.call_count == 1
         assert [s.search_id for s in _snapshots(session)] == [2]
@@ -399,19 +434,30 @@ class TestSchedulerOtherErrorsAreNotHidden:
         # (ScraperError estende RuntimeError: un RuntimeError qualsiasi non e' un ScraperError).
         assert "scraper" not in errors[0].getMessage().lower()
 
-    def test_errors_in_the_alert_step_are_not_swallowed(self):
-        """Il boundary per-ricerca copre SOLO lo scraping: un errore negli alert si propaga come prima."""
+    def test_errors_in_the_alert_step_are_isolated_per_search_but_never_hidden(self, caplog):
+        """
+        Contratto AGGIORNATO (F2). Prima un errore negli alert si propagava e interrompeva
+        l'intero ciclo (le ricerche successive andavano perse). Ora e' isolato per ricerca,
+        ma NON nascosto: si registra con la ricerca interessata e il traceback originale.
+        """
+        searches = [_search(1), _search(2)]
         session = MagicMock()
-        session.query.return_value.filter_by.return_value.all.return_value = [_search(1)]
-        alert = AsyncMock(side_effect=ValueError("errore negli alert"))
+        session.query.return_value.filter_by.return_value.all.return_value = searches
+        error = ValueError("errore negli alert")
+        alert = AsyncMock(side_effect=[error, None])        # fallisce solo per la 1ª ricerca
 
         with patch.object(scheduler, "SessionLocal", return_value=session), \
              patch.object(scheduler, "Bot"), \
-             patch.object(scheduler, "scrape_google", side_effect=[_price(50.0)]), \
-             patch.object(scheduler, "maybe_send_alert", alert):
-            with pytest.raises(ValueError, match="errore negli alert"):
-                asyncio.run(scheduler.run_scraping_cycle())
+             patch.object(scheduler, "scrape_google", side_effect=[_price(50.0), _price(60.0)]), \
+             patch.object(scheduler, "maybe_send_alert", alert), \
+             caplog.at_level(logging.INFO, logger="flight_bot.scheduler"):
+            asyncio.run(scheduler.run_scraping_cycle())      # nessuna eccezione
 
+        assert alert.await_count == 2                       # la 2ª ricerca e' stata comunque gestita
+        assert [c.args[0].search_id for c in session.add.call_args_list] == [1, 2]
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1 and "search_id=1" in errors[0].getMessage()
+        assert errors[0].exc_info[1] is error               # traceback dell'errore originale
         session.close.assert_called_once()                  # la sessione si chiude comunque
 
 
@@ -471,17 +517,27 @@ class TestRealScraperChainOnlyNetworkMocked:
         alert = AsyncMock()
         with patch.object(scheduler, "SessionLocal", return_value=session), \
              patch.object(scheduler, "Bot"), \
+             patch.object(scheduler, "_sleep", new=AsyncMock()) as sleep, \
              patch.object(scheduler, "maybe_send_alert", alert), \
              patch("scrapers.google_flights._client") as client, \
              caplog.at_level(logging.INFO, logger="flight_bot.scheduler"):
-            client.get.side_effect = [primp.TimeoutError("operation timed out"),
-                                      _http_response(GOOGLE_ERROR_PAGE)]
+            # 1° passaggio: ricerca 1 in timeout (ritentabile), ricerca 2 con errore di Google
+            # (non ritentabile: fallimento subito). Poi la sola ricerca 1 va in timeout ai
+            # due passaggi di retry.
+            client.get.side_effect = [
+                primp.TimeoutError("operation timed out"),
+                _http_response(GOOGLE_ERROR_PAGE),
+                primp.TimeoutError("operation timed out"),
+                primp.TimeoutError("operation timed out"),
+            ]
             asyncio.run(scheduler.run_scraping_cycle())      # nessuna eccezione
 
-        assert client.get.call_count == 2                    # entrambe le ricerche sono state tentate
+        assert client.get.call_count == 4                    # ricerca 1 x3 tentativi + ricerca 2 x1
+        assert sleep.await_count == 2                        # attese mockate: nessuna attesa reale
         session.add.assert_not_called()
         alert.assert_not_called()
         errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
-        assert [("search_id=1" in r.getMessage(), "search_id=2" in r.getMessage()) for r in errors] == [
-            (True, False), (False, True)]
+        # un solo errore definitivo per ricerca (in ordine di chiusura: la 2 subito, la 1 dopo i retry)
+        assert sorted(("search_id=1" in r.getMessage(), "search_id=2" in r.getMessage())
+                      for r in errors) == [(False, True), (True, False)]
         assert "FlightsNotFound" in caplog.text
