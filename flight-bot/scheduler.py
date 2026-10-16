@@ -35,6 +35,56 @@ from calibration import recalibrate, _find_red_period
 
 logger = logging.getLogger("flight_bot.scheduler")
 
+
+def _next_weekend_dates(n_weekends: int) -> list[tuple[datetime, datetime]]:
+    """Genera le prossime n coppie (partenza sabato sera, ritorno domenica sera)."""
+    results = []
+    today = datetime.now()
+    days_until_saturday = (WEEKEND_DEPARTURE_WEEKDAY - today.weekday()) % 7
+    first_saturday = today + timedelta(days=days_until_saturday)
+
+    for i in range(n_weekends):
+        saturday = first_saturday + timedelta(weeks=i)
+        departure = saturday.replace(hour=WEEKEND_DEPARTURE_MIN_HOUR, minute=0, second=0, microsecond=0)
+        sunday = saturday + timedelta(days=1)
+        ret = sunday.replace(hour=WEEKEND_RETURN_MIN_HOUR, minute=0, second=0, microsecond=0)
+        results.append((departure, ret))
+    return results
+
+
+def discover_new_weekends():
+    session = SessionLocal()
+    try:
+        for departure, ret in _next_weekend_dates(WEEKENDS_HORIZON_TO_TRACK):
+            red_period = _find_red_period(departure)
+            for route in AUTO_ROUTES:
+                exists = session.query(MonitoredSearch).filter_by(
+                    origin=route["origin"],
+                    destination=route["destination"],
+                    departure_date=departure,
+                    return_date=ret,
+                    monitor_type=MonitorType.AUTO_WEEKEND,
+                ).first()
+                if exists:
+                    continue
+                new_search = MonitoredSearch(
+                    origin=route["origin"],
+                    destination=route["destination"],
+                    departure_date=departure,
+                    return_date=ret,
+                    monitor_type=MonitorType.AUTO_WEEKEND,
+                    telegram_topic_id=route["topic_id"],
+                    red_period_name=red_period.name if red_period else None,
+                )
+                session.add(new_search)
+                session.flush()  # assegna l'id senza fare un commit vero e proprio
+                new_search.flight_key = build_flight_key(new_search)
+        session.commit()
+        logger.info("discover_new_weekends: sincronizzazione completata")
+    finally:
+        session.close()
+
+
 # --- Retry degli errori tecnici TEMPORANEI dello scraper ----------------------------
 # La decisione "questo errore va ritentato?" e' una policy applicativa: sta qui, non
 # nello scraper (che si limita a sollevare ScraperError).
