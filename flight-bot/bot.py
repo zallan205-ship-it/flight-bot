@@ -25,6 +25,7 @@ from config import TELEGRAM_BOT_TOKEN, TOPIC_MANUAL, SEARCH_MAX_OPTIONS, SEARCH_
 from db import SessionLocal
 from models import MonitoredSearch, MonitorType, build_flight_key
 from calibration import _find_red_period
+from scrape_runner import ScrapeRunnerClosed, run_scrape
 from scrapers.google_flights import search_options, ScraperError
 
 logger = logging.getLogger("flight_bot.bot")
@@ -180,8 +181,9 @@ async def cerca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cerco voli senza scali, un momento...")
 
     try:
-        opzioni = search_options(origin, destination, departure, return_date,
-                                  max_results=SEARCH_MAX_OPTIONS)
+        # Chiamata sincrona e bloccante (rete): fuori dall'event loop, una alla volta.
+        opzioni = await run_scrape(search_options, origin, destination, departure, return_date,
+                                   max_results=SEARCH_MAX_OPTIONS)
     except ScraperError:
         # Errore tecnico dello scraper (rete, HTTP, consenso, parsing, risposta di
         # errore di Google): NON e' "nessun volo". Il dettaglio tecnico (traceback
@@ -193,6 +195,17 @@ async def cerca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(
             "Non sono riuscito a recuperare i voli in questo momento. Riprova più tardi."
+        )
+        return
+    except ScrapeRunnerClosed:
+        # Il runner dello scraping e' chiuso: l'applicazione si sta arrestando. Non e' un errore
+        # dello scraper ne' un bug: messaggio dedicato, senza dettagli interni all'utente.
+        logger.warning(
+            "/cerca rifiutato: il runner dello scraping e' chiuso (%s -> %s, partenza %s)",
+            origin, destination, departure,
+        )
+        await update.message.reply_text(
+            "Il servizio di ricerca non è momentaneamente disponibile. Riprova tra poco."
         )
         return
     except Exception as e:
