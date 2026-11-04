@@ -4,6 +4,7 @@ import logging
 from db import init_db
 from scheduler import start_scheduler, discover_new_weekends, deactivate_expired_searches
 from bot import build_application
+from scrape_runner import shutdown_scrape_runner
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
@@ -23,10 +24,16 @@ async def main():
     try:
         await asyncio.Event().wait()  # tiene vivo il processo
     finally:
-        scheduler.shutdown()
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+        try:
+            scheduler.shutdown()
+            await application.updater.stop()
+            await application.stop()
+            await application.shutdown()
+        finally:
+            # Per ultimo, e anche se uno degli arresti sopra solleva: ormai non partono piu'
+            # ricerche. Le chiamate ancora in coda vengono annullate; quella in corso termina
+            # da sola (al massimo il timeout HTTP) e l'interprete la attende all'uscita.
+            shutdown_scrape_runner()
 
 
 if __name__ == "__main__":

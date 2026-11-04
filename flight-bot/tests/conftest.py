@@ -32,6 +32,21 @@ def _no_real_waits(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _fresh_scrape_runner(monkeypatch):
+    """
+    Ogni test riceve un runner dello scraping NUOVO e lo chiude a fine test. Senza questo, un
+    test che arresta l'applicazione (main.main() chiude il runner) lascerebbe il runner globale
+    chiuso per tutti i test successivi, e la suite dipenderebbe dall'ordine dei file.
+    """
+    import scrape_runner
+
+    runner = scrape_runner.ScrapeRunner()
+    monkeypatch.setattr(scrape_runner, "_default", runner)
+    yield runner
+    runner.shutdown(wait=False)
+
+
+@pytest.fixture(autouse=True)
 def _reset_scheduler_failure_state():
     """
     Lo stato dei fallimenti consecutivi dello scheduler e' a livello di modulo (in memoria):

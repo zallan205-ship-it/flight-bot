@@ -29,6 +29,7 @@ from config import (
 )
 from db import SessionLocal
 from models import MonitoredSearch, PriceSnapshot, MonitorType, build_flight_key
+from scrape_runner import run_scrape
 from scrapers.google_flights import scrape_price as scrape_google, ScraperError
 from alerts import maybe_send_alert
 from calibration import recalibrate, _find_red_period
@@ -240,8 +241,14 @@ def _recover_session(session) -> None:
         logger.exception("Rollback della sessione dopo un errore di salvataggio fallito")
 
 
-def _scrape_search(session, search: MonitoredSearch):
-    """UNA chiamata allo scraper per la ricerca (puo' sollevare ScraperError)."""
+async def _scrape_search(session, search: MonitoredSearch):
+    """
+    UNA chiamata allo scraper per la ricerca (puo' sollevare ScraperError).
+
+    Nel thread dello scraper passano SOLO la funzione e valori semplici (stringhe, date,
+    numeri): la lettura degli attributi della ricerca e il rilascio della connessione DB
+    avvengono prima, sul thread dell'event loop.
+    """
     # Il filtro sull'orario vale in due casi: i weekend automatici
     # (fascia serale fissa da config) e i monitoraggi nati da /cerca
     # (fascia stretta attorno al volo scelto, salvata sulla singola
@@ -267,7 +274,9 @@ def _scrape_search(session, search: MonitoredSearch):
     departure_date, return_date = search.departure_date, search.return_date
     _release_connection(session)
 
-    return scrape_google(
+    # La chiamata e' sincrona e bloccante (rete): fuori dall'event loop, una alla volta.
+    return await run_scrape(
+        scrape_google,
         origin, destination,
         departure_date, return_date,
         earliest_departure_hour=earliest_departure_hour,
@@ -325,7 +334,7 @@ async def _run_pass(session, bot: Bot, searches: list[MonitoredSearch]):
     retryable: list[tuple[MonitoredSearch, ScraperError]] = []
     for search in searches:
         try:
-            result = _scrape_search(session, search)
+            result = await _scrape_search(session, search)
         except ScraperError as error:
             # Errore tecnico dello scraper: NON e' "nessun volo". Nessuno snapshot e
             # nessun alert di prezzo per questa ricerca.
