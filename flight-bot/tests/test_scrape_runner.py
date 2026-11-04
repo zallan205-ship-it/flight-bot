@@ -222,7 +222,7 @@ class TestCancellation:
             for _ in range(3):
                 started, release = threading.Event(), threading.Event()
 
-                def work():
+                def work(started=started, release=release):
                     started.set()
                     release.wait(5)
 
