@@ -437,7 +437,8 @@ class TestUseAfterShutdown:
             result = asyncio.run(_run_cycle([_search(1), _search(2)], scrape))
 
         assert calls == []                                       # nessuna chiamata allo scraper
-        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        errors = [r for r in caplog.records
+                  if r.name == "flight_bot.scheduler" and r.levelno >= logging.ERROR]
         assert len(errors) == 2
         assert all(isinstance(r.exc_info[1], ScrapeRunnerClosed) for r in errors)
         assert scheduler._consecutive_failures == {}             # non e' un fallimento di ricerca

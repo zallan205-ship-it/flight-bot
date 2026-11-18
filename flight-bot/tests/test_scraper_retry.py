@@ -73,6 +73,15 @@ VALID_EMPTY_PAGE = (
 TECH_SECRET = "SECRET-TECH-DETAIL-98765"
 
 
+def _scheduler_log_text(caplog):
+    formatter = logging.Formatter()
+    return "\n".join(
+        record.getMessage() + ("\n" + formatter.formatException(record.exc_info)
+                               if record.exc_info else "")
+        for record in caplog.records if record.name == "flight_bot.scheduler"
+    )
+
+
 # ---------------------------------------------------------------- errori e prezzi ----
 
 def _error(message="errore tecnico", *, status=None, timed_out=False, cause=None):
@@ -546,7 +555,8 @@ class TestCycleIsolation:
         assert cycle.delays == []
         assert sorted(_snapshot_ids(cycle)) == [1, 3]
         assert scheduler._consecutive_failures == {2: 2}           # ne' +1 ne' azzerato
-        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        errors = [r for r in caplog.records
+                  if r.name == "flight_bot.scheduler" and r.levelno >= logging.ERROR]
         assert len(errors) == 1 and "search_id=2" in errors[0].getMessage()
         assert isinstance(errors[0].exc_info[1], ValueError)
 
@@ -557,13 +567,14 @@ class TestCycleIsolation:
         with caplog.at_level(logging.INFO, logger="flight_bot.scheduler"):
             _run_cycle(searches, {1: [_price(1)], 2: [_timeout(), _timeout(), last]})
 
-        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        errors = [r for r in caplog.records
+                  if r.name == "flight_bot.scheduler" and r.levelno >= logging.ERROR]
         assert len(errors) == 1                                    # uno solo, non uno per tentativo
         message = errors[0].getMessage()
         assert "search_id=2" in message and "CAGPSA0002" in message
         assert "CAG" in message and "PSA" in message
         assert errors[0].exc_info[1] is last                       # traceback dell'ultimo errore
-        assert str(last.__cause__) in caplog.text
+        assert str(last.__cause__) in _scheduler_log_text(caplog)
 
     def test_the_next_cycle_runs_normally_after_a_failing_one(self):
         searches = [_search(1), _search(2)]
@@ -841,7 +852,7 @@ class TestAggregatedAdminAlert:
             for _ in range(3):
                 _run_cycle([_search(1)], {1: [error]}, bot=bot)
 
-        assert TECH_SECRET in caplog.text
+        assert TECH_SECRET in _scheduler_log_text(caplog)
         assert TECH_SECRET not in bot.send_message.await_args.kwargs["text"]
 
     def test_text_for_a_single_search_uses_the_singular(self):
@@ -876,7 +887,8 @@ class TestAggregatedAdminAlert:
         assert _snapshot_ids(cycle) == [2]                          # il ciclo e' stato completato
         assert scheduler._admin_alert_sent is False                 # NON risulta inviato...
         assert any("alert amministrativo" in r.getMessage() and r.exc_info
-                   for r in caplog.records if r.levelno >= logging.ERROR)
+                   for r in caplog.records if r.name == "flight_bot.scheduler"
+                   and r.levelno >= logging.ERROR)
 
         bot.send_message.side_effect = None                         # ...Telegram torna su
         _run_cycle(searches, {1: [_http(403)], 2: [_price(9)]}, bot=bot)
@@ -1093,7 +1105,8 @@ class TestBodyReadTimeoutIsRetried:
         assert client.get.call_count == 3                        # 1 tentativo + 2 retry, non di piu'
         assert cycle.delays == [pytest.approx(60.0), pytest.approx(180.0)]
         assert scheduler._consecutive_failures == {1: 1}
-        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        errors = [r for r in caplog.records
+                  if r.name == "flight_bot.scheduler" and r.levelno >= logging.ERROR]
         assert len(errors) == 1
         assert errors[0].exc_info[1].timed_out is True
         assert isinstance(errors[0].exc_info[1].__cause__, primp.TimeoutError)
@@ -1180,7 +1193,8 @@ class TestStoreResultIsolation:
         with caplog.at_level(logging.INFO, logger="flight_bot.scheduler"):
             _run_cycle(searches, {s.id: [_price(5)] for s in searches}, price_alert=alert)
 
-        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        errors = [r for r in caplog.records
+                  if r.name == "flight_bot.scheduler" and r.levelno >= logging.ERROR]
         assert len(errors) == 1
         assert "search_id=2" in errors[0].getMessage() and "CAGPSA0002" in errors[0].getMessage()
         assert errors[0].exc_info[1] is alert.raised[2]          # traceback dell'errore ORIGINALE
@@ -1364,7 +1378,8 @@ class TestRealSessionBehaviour:
             saved = sorted((s.search_id, s.price_eur) for s in check.query(PriceSnapshot).all())
         assert saved == [(ids[1], 20.0), (ids[2], 30.0)]         # la 1ª non salvata, le altre si'
         assert [c.args[2].id for c in alert.call_args_list] == [ids[1], ids[2]]   # nessun alert per la 1ª
-        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        messages = [r.getMessage() for r in caplog.records
+                    if r.name == "flight_bot.scheduler" and r.levelno >= logging.ERROR]
         assert len(messages) == 1 and f"search_id={ids[0]}" in messages[0]
         assert not any("Scraping fallito" in m for m in messages)  # nessuna cascata (PendingRollbackError)
         assert set(in_use["scrape"]) == {0}, in_use              # e nessuna connessione trattenuta

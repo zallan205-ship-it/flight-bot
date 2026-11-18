@@ -27,6 +27,7 @@ from models import MonitoredSearch, MonitorType, build_flight_key
 from calibration import _find_red_period
 from scrape_runner import ScrapeRunnerClosed, run_scrape
 from scrapers.google_flights import search_options, ScraperError
+from diagnostics import diagnostic_context, emit_exception, new_id
 
 logger = logging.getLogger("flight_bot.bot")
 
@@ -180,10 +181,13 @@ async def cerca(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Cerco voli senza scali, un momento...")
 
+    correlation_id = new_id()
     try:
         # Chiamata sincrona e bloccante (rete): fuori dall'event loop, una alla volta.
-        opzioni = await run_scrape(search_options, origin, destination, departure, return_date,
-                                   max_results=SEARCH_MAX_OPTIONS)
+        with diagnostic_context(operation="manual_search", correlation_id=correlation_id,
+                                search_id=None, attempt=1):
+            opzioni = await run_scrape(search_options, origin, destination, departure, return_date,
+                                       max_results=SEARCH_MAX_OPTIONS)
     except ScraperError:
         # Errore tecnico dello scraper (rete, HTTP, consenso, parsing, risposta di
         # errore di Google): NON e' "nessun volo". Il dettaglio tecnico (traceback
@@ -209,6 +213,9 @@ async def cerca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     except Exception as e:
+        emit_exception("unexpected_manual_search_exception", e, stage="scrape",
+                       operation="manual_search", correlation_id=correlation_id,
+                       search_id=None, attempt=1)
         await update.message.reply_text(f"Errore durante la ricerca: {e}")
         return
 
