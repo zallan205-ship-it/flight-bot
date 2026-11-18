@@ -29,6 +29,8 @@ import functools
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+from diagnostics import context_snapshot
+
 
 class ScrapeRunnerClosed(RuntimeError):
     """Richiesto uno scraping dopo lo shutdown del runner (l'applicazione si sta chiudendo).
@@ -57,7 +59,8 @@ class ScrapeRunner:
         invariate al chiamante.
         """
         loop = asyncio.get_running_loop()
-        call = functools.partial(func, *args, **kwargs)
+        captured_context = context_snapshot()
+        call = functools.partial(captured_context.run, func, *args, **kwargs)
         # Controllo e inserimento in coda sono atomici rispetto a shutdown(): non esiste una
         # finestra in cui il flag e' falso ma l'executor e' gia' chiuso.
         with self._lock:

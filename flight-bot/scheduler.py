@@ -33,6 +33,7 @@ from scrape_runner import run_scrape
 from scrapers.google_flights import scrape_price as scrape_google, ScraperError
 from alerts import maybe_send_alert
 from calibration import recalibrate, _find_red_period
+from diagnostics import diagnostic_context, emit_exception, new_id
 
 logger = logging.getLogger("flight_bot.scheduler")
 
@@ -320,7 +321,8 @@ def _log_definitive_failure(search: MonitoredSearch, error: ScraperError) -> Non
     _record_failure(search.id)
 
 
-async def _run_pass(session, bot: Bot, searches: list[MonitoredSearch]):
+async def _run_pass(session, bot: Bot, searches: list[MonitoredSearch], *, cycle_id=None,
+                    correlation_ids=None, attempt=1):
     """
     Un passaggio: UNA chiamata allo scraper per ciascuna ricerca. Isola gli errori:
     una ricerca che fallisce non ferma le altre.
@@ -333,37 +335,52 @@ async def _run_pass(session, bot: Bot, searches: list[MonitoredSearch]):
     """
     retryable: list[tuple[MonitoredSearch, ScraperError]] = []
     for search in searches:
-        try:
-            result = await _scrape_search(session, search)
-        except ScraperError as error:
-            # Errore tecnico dello scraper: NON e' "nessun volo". Nessuno snapshot e
-            # nessun alert di prezzo per questa ricerca.
-            if _is_retryable(error):
-                retryable.append((search, error))
-            else:
-                _log_definitive_failure(search, error)
-            continue
-        except Exception:
-            logger.exception("Scraping fallito per search_id=%s", search.id)
-            continue
+        context = diagnostic_context(
+            operation="scheduled_search", cycle_id=cycle_id,
+            correlation_id=(correlation_ids or {}).get(search.id),
+            search_id=search.id, attempt=attempt,
+        )
+        with context:
+            try:
+                result = await _scrape_search(session, search)
+            except ScraperError as error:
+                # Errore tecnico dello scraper: NON e' "nessun volo". Nessuno snapshot e
+                # nessun alert di prezzo per questa ricerca.
+                if _is_retryable(error):
+                    retryable.append((search, error))
+                else:
+                    _log_definitive_failure(search, error)
+                continue
+            except Exception as error:
+                emit_exception("unexpected_scheduler_exception", error, stage="scrape")
+                logger.exception("Scraping fallito per search_id=%s", search.id)
+                continue
 
         _record_success(search.id)   # risposta valida (anche "nessun volo"): azzera la serie
         # Letti ORA, finche' l'oggetto e' caricato: dopo un commit fallito SQLAlchemy fa scadere
         # tutti gli oggetti e rileggerli su una sessione inattiva solleverebbe PendingRollbackError
         # proprio nel gestore che deve isolare l'errore.
         label = (search.id, search.flight_key, search.origin, search.destination)
-        try:
-            await _store_result(session, bot, search, result)
-        except Exception:
-            logger.exception(
-                "Salvataggio del risultato o alert di prezzo fallito per search_id=%s "
-                "(%s, %s -> %s)", *label,
-            )
-            _recover_session(session)
+        with diagnostic_context(
+            operation="scheduled_search", cycle_id=cycle_id,
+            correlation_id=(correlation_ids or {}).get(search.id),
+            search_id=search.id, attempt=attempt,
+        ):
+            try:
+                await _store_result(session, bot, search, result)
+            except Exception as error:
+                emit_exception("unexpected_scheduler_exception", error, stage="store_or_alert")
+                logger.exception(
+                    "Salvataggio del risultato o alert di prezzo fallito per search_id=%s "
+                    "(%s, %s -> %s)", *label,
+                )
+                _recover_session(session)
     return retryable
 
 
 async def run_scraping_cycle():
+    cycle_id = new_id()
+    correlation_ids = {}
     session = SessionLocal()
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     try:
@@ -375,12 +392,14 @@ async def run_scraping_cycle():
 
         # Voli nel passato: da disattivare (pulizia periodica separata), non si controllano.
         to_check = [s for s in active_searches if (s.departure_date - datetime.now()).days >= 0]
+        correlation_ids = {s.id: new_id() for s in to_check}
         searches_by_id = {s.id: s for s in to_check}      # ids letti ora, a oggetti ancora caricati
         _forget_stale_failures(set(searches_by_id))
 
         # Primo passaggio su TUTTE le ricerche, poi al massimo 2 passaggi di retry sulle
         # sole ricerche fallite con un errore temporaneo (mai su quelle riuscite).
-        retryable = await _run_pass(session, bot, to_check)
+        retryable = await _run_pass(session, bot, to_check, cycle_id=cycle_id,
+                                     correlation_ids=correlation_ids, attempt=1)
         for retry_index in range(len(SCRAPE_RETRY_BASE_DELAYS_SECONDS)):
             if not retryable:
                 break
@@ -392,7 +411,9 @@ async def run_scraping_cycle():
             )
             _release_connection(session)          # nessuna transazione aperta durante l'attesa
             await _sleep(delay)
-            retryable = await _run_pass(session, bot, [s for s, _ in retryable])
+            retryable = await _run_pass(session, bot, [s for s, _ in retryable],
+                                         cycle_id=cycle_id, correlation_ids=correlation_ids,
+                                         attempt=retry_index + 2)
 
         # Retry esauriti: fallimento definitivo (+1 al contatore, una volta per ciclo).
         for search, error in retryable:

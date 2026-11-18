@@ -14,12 +14,14 @@ il payload "errorHasStatus" e il payload vuoto riproducono i tre casi che
 parse() distingue nella versione di fast-flights attualmente in uso.
 """
 import json
+import hashlib
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import primp
 import pytest
+import scrapers.google_flights as google_flights
 
 from scrapers.google_flights import (
     GOOGLE_FLIGHTS_URL,
@@ -119,6 +121,96 @@ class TestFetchHtmlNetworkAndHttpFailures:
 
         assert excinfo.value.__cause__ is error
         assert type(error).__name__ in str(excinfo.value)
+
+    @pytest.mark.parametrize("status", [200, 403, 429, 500, 503])
+    @patch("scrapers.google_flights.emit")
+    @patch("scrapers.google_flights.emit_exception")
+    @patch("scrapers.google_flights._client")
+    def test_http_diagnostic_events_contain_only_status_and_stage(
+            self, mock_client, mock_emit_exception, mock_emit, status):
+        mock_client.get.return_value = _response(status=status)
+        if status >= 400:
+            with pytest.raises(ScraperError):
+                _request("get", GOOGLE_FLIGHTS_URL)
+            call = mock_emit_exception.call_args
+            assert call.args[0] == "http_status_error"
+            assert type(call.args[1]).__name__ == "StatusError"
+            fields = call.kwargs
+        else:
+            _request("get", GOOGLE_FLIGHTS_URL)
+            call = next(call for call in mock_emit.call_args_list
+                        if call.args[0] == "http_response")
+            fields = call.kwargs
+        assert fields["status_code"] == status
+        assert fields["stage"] == "http_get"
+        assert "url" not in fields and "body" not in fields
+
+    @pytest.mark.parametrize("error", [
+        primp.TimeoutError("private timeout detail"),
+        primp.ConnectError("private connection detail"),
+    ], ids=["timeout", "connection"])
+    @patch("scrapers.google_flights.emit_exception")
+    @patch("scrapers.google_flights._client")
+    def test_transport_diagnostic_exposes_only_exception_class(self, mock_client, mock_emit, error):
+        mock_client.get.side_effect = error
+        with pytest.raises(ScraperError):
+            _request("get", GOOGLE_FLIGHTS_URL)
+        mock_emit.assert_called_once()
+        event, exception_type, fields = mock_emit.call_args.args[0], type(mock_emit.call_args.args[1]).__name__, mock_emit.call_args.kwargs
+        assert event == "http_transport_error"
+        assert exception_type == type(error).__name__
+        assert fields == {"stage": "http_get"}
+        # La chiamata riceve l'eccezione originale per estrarne solo la classe;
+        # non deve mai trasformarne il messaggio in campi diagnostici.
+        assert "private" not in repr(fields)
+
+    @patch("scrapers.google_flights.emit")
+    def test_empty_response_body_emits_anomaly_without_body(self, mock_emit):
+        response = _response(text="")
+        from scrapers.google_flights import _response_text
+        assert _response_text(response) == ""
+        assert any(call.args[0] == "response_anomaly" for call in mock_emit.call_args_list)
+        assert all("body" not in call.kwargs for call in mock_emit.call_args_list)
+
+    @patch("scrapers.google_flights.emit")
+    def test_response_body_is_hashed_in_memory_without_logging_its_contents(self, mock_emit):
+        from scrapers.google_flights import _response_text
+        body = "private response content"
+        assert _response_text(_response(text=body)) == body
+        event = next(call for call in mock_emit.call_args_list
+                     if call.args[0] == "response_read")
+        assert event.kwargs["body_sha256"] == hashlib.sha256(body.encode()).hexdigest()
+        assert event.kwargs["response_bytes"] == len(body.encode())
+        assert body not in repr(mock_emit.call_args_list)
+
+    @patch("scrapers.google_flights.emit")
+    @patch("scrapers.google_flights._client")
+    def test_consent_flow_emits_stages_without_url_or_body(self, mock_client, mock_emit):
+        mock_client.get.return_value = _response(text=CONSENT_HTML, url=CONSENT_URL)
+        mock_client.post.return_value = _response(text="<html>results</html>")
+        assert _fetch_html(_query()) == "<html>results</html>"
+        names = [call.args[0] for call in mock_emit.call_args_list]
+        assert "consent_redirect" in names
+        assert "consent_detected" in names
+        assert "consent_submitted" in names
+        assert all("url" not in call.kwargs and "body" not in call.kwargs
+                   for call in mock_emit.call_args_list)
+
+    def test_parse_exception_event_omits_exception_message(self, monkeypatch):
+        emitted = []
+
+        def fail_parse(_html):
+            raise ValueError("sensitive parser detail")
+
+        monkeypatch.setattr(google_flights, "_fetch_html", lambda _query: "<html></html>")
+        monkeypatch.setattr(google_flights, "parse", fail_parse)
+        monkeypatch.setattr(google_flights, "emit_exception",
+                            lambda event, exc, **fields: emitted.append(
+                                (event, type(exc).__name__, fields)))
+        with pytest.raises(ScraperError):
+            search_leg("PSA", "CAG", DEPARTURE)
+        assert emitted == [("unexpected_scraper_exception", "ValueError", {"stage": "parse_or_fetch"})]
+        assert "sensitive parser detail" not in repr(emitted)
 
     @pytest.mark.parametrize("status", [403, 429, 500, 503])
     @patch("scrapers.google_flights._client")

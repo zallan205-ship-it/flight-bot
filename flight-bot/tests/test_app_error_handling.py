@@ -59,6 +59,15 @@ FORBIDDEN_IN_USER_TEXT = (
 )
 
 
+def _application_log_text(caplog, logger_name):
+    formatter = logging.Formatter()
+    return "\n".join(
+        record.getMessage() + ("\n" + formatter.formatException(record.exc_info)
+                               if record.exc_info else "")
+        for record in caplog.records if record.name == logger_name
+    )
+
+
 def _scraper_error(message, cause, **attributes):
     """ScraperError REALE sollevata `from cause` (come fa lo scraper), non assemblata a mano."""
     try:
@@ -169,7 +178,8 @@ class TestCercaSuccessIsUnchanged:
         assert texts[1] != GENERIC_ERROR_MESSAGE
         assert "reply_markup" not in reply.call_args_list[1].kwargs
         # Un risultato valido senza voli NON e' un errore: niente log di errore.
-        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not [r for r in caplog.records
+                    if r.name == "flight_bot.bot" and r.levelno >= logging.ERROR]
 
 
 class TestCercaScraperError:
@@ -214,8 +224,9 @@ class TestCercaScraperError:
         assert "PSA" in record.getMessage() and "CAG" in record.getMessage()
         assert "2026-12-25" in record.getMessage()
         # il testo tecnico, e la causa originale, sono nel log formattato
-        assert str(technical_error) in caplog.text
-        assert str(technical_error.__cause__) in caplog.text
+        app_log_text = _application_log_text(caplog, "flight_bot.bot")
+        assert str(technical_error) in app_log_text
+        assert str(technical_error.__cause__) in app_log_text
 
 
 class TestCercaOtherErrorsAreNotHidden:
@@ -231,6 +242,20 @@ class TestCercaOtherErrorsAreNotHidden:
         # comportamento preesistente (invariato in questo task): vedi report
         assert texts[1] == f"Errore durante la ricerca: {error}"
         assert texts[1] != GENERIC_ERROR_MESSAGE
+
+    def test_unexpected_cerca_exception_has_safe_diagnostic_event(self, monkeypatch):
+        events = []
+        monkeypatch.setattr(bot, "emit_exception",
+                            lambda event, exc, **fields: events.append(
+                                (event, type(exc).__name__, fields)))
+        _run_cerca(ONE_WAY_ARGS, side_effect=ValueError("do-not-log-this"))
+        assert len(events) == 1
+        name, exception_type, fields = events[0]
+        assert name == "unexpected_manual_search_exception"
+        assert exception_type == "ValueError"
+        assert fields["stage"] == "scrape"
+        assert fields["search_id"] is None and fields["attempt"] == 1
+        assert "do-not-log-this" not in repr(events)
 
     def test_plain_runtime_error_is_not_mistaken_for_scraper_error(self):
         """ScraperError estende RuntimeError: il contrario non deve valere."""
@@ -361,7 +386,8 @@ class TestSchedulerScraperError:
         with caplog.at_level(logging.INFO, logger="flight_bot.scheduler"):
             _run_cycle(searches, [_price(50.0), technical_error, _price(60.0)])
 
-        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        errors = [r for r in caplog.records
+                  if r.name == "flight_bot.scheduler" and r.levelno >= logging.ERROR]
         assert len(errors) == 1                             # solo la ricerca fallita
         record = errors[0]
         message = record.getMessage()
@@ -370,15 +396,17 @@ class TestSchedulerScraperError:
         assert "CAGPSA0002" in message                      # flight_key della ricerca fallita
         assert "CAG" in message and "PSA" in message        # rotta
         assert record.exc_info is not None and record.exc_info[1] is technical_error
-        assert str(technical_error) in caplog.text          # dettaglio tecnico nel log
-        assert str(technical_error.__cause__) in caplog.text  # causa originale nel log
+        app_log_text = _application_log_text(caplog, "flight_bot.scheduler")
+        assert str(technical_error) in app_log_text          # dettaglio tecnico nel log
+        assert str(technical_error.__cause__) in app_log_text  # causa originale nel log
 
     def test_error_is_not_treated_as_no_flights(self, technical_error, caplog):
         """Valid empty (None) = silenzioso; ScraperError = errore registrato."""
         with caplog.at_level(logging.INFO, logger="flight_bot.scheduler"):
             _run_cycle([_search(1), _search(2)], [None, technical_error])
 
-        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        errors = [r for r in caplog.records
+                  if r.name == "flight_bot.scheduler" and r.levelno >= logging.ERROR]
         assert len(errors) == 1 and "search_id=2" in errors[0].getMessage()
 
     def test_valid_no_flights_result_is_unchanged(self, caplog):
@@ -390,7 +418,8 @@ class TestSchedulerScraperError:
         assert scrape.call_count == 3
         assert [s.search_id for s in _snapshots(session)] == [1, 3]
         assert _alerted_search_ids(alert) == [1, 3]
-        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not [r for r in caplog.records
+                    if r.name == "flight_bot.scheduler" and r.levelno >= logging.ERROR]
 
     def test_automatic_weekend_searches_are_isolated_too(self, technical_error):
         searches = [_search(1, monitor_type=MonitorType.AUTO_WEEKEND),
@@ -426,13 +455,23 @@ class TestSchedulerOtherErrorsAreNotHidden:
         assert scrape.call_count == 3
         assert [s.search_id for s in _snapshots(session)] == [1, 3]
         assert _alerted_search_ids(alert) == [1, 3]
-        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        errors = [r for r in caplog.records
+                  if r.name == "flight_bot.scheduler" and r.levelno >= logging.ERROR]
         assert len(errors) == 1
         assert "search_id=2" in errors[0].getMessage()
         assert errors[0].exc_info is not None and errors[0].exc_info[1] is error
         # Un errore imprevisto NON va etichettato come errore tecnico dello scraper
         # (ScraperError estende RuntimeError: un RuntimeError qualsiasi non e' un ScraperError).
         assert "scraper" not in errors[0].getMessage().lower()
+
+    def test_unexpected_scheduler_exception_has_safe_diagnostic_event(self, monkeypatch):
+        events = []
+        monkeypatch.setattr(scheduler, "emit_exception",
+                            lambda event, exc, **fields: events.append(
+                                (event, type(exc).__name__, fields)))
+        _run_cycle([_search(1)], [ValueError("do-not-log-this")])
+        assert events == [("unexpected_scheduler_exception", "ValueError", {"stage": "scrape"})]
+        assert "do-not-log-this" not in repr(events)
 
     def test_errors_in_the_alert_step_are_isolated_per_search_but_never_hidden(self, caplog):
         """
@@ -455,7 +494,8 @@ class TestSchedulerOtherErrorsAreNotHidden:
 
         assert alert.await_count == 2                       # la 2ª ricerca e' stata comunque gestita
         assert [c.args[0].search_id for c in session.add.call_args_list] == [1, 2]
-        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        errors = [r for r in caplog.records
+                  if r.name == "flight_bot.scheduler" and r.levelno >= logging.ERROR]
         assert len(errors) == 1 and "search_id=1" in errors[0].getMessage()
         assert errors[0].exc_info[1] is error               # traceback dell'errore originale
         session.close.assert_called_once()                  # la sessione si chiude comunque
@@ -489,15 +529,36 @@ class TestRealScraperChainOnlyNetworkMocked:
 
     def test_cerca_google_error_payload_gives_generic_message_and_detail_in_logs(self, caplog):
         update, context, reply = _update_and_context(ONE_WAY_ARGS)
+        diagnostic_logger = logging.getLogger("flight_bot.diagnostic")
+        # Il logger diagnostico non propaga al root: agganciamo caplog direttamente
+        # così possiamo verificarlo separatamente dai log applicativi.
+        diagnostic_logger.addHandler(caplog.handler)
         with patch("scrapers.google_flights._client") as client, \
              caplog.at_level(logging.INFO, logger="flight_bot.bot"):
-            client.get.return_value = _http_response(GOOGLE_ERROR_PAGE)
-            asyncio.run(bot.cerca(update, context))
+            try:
+                client.get.return_value = _http_response(GOOGLE_ERROR_PAGE)
+                asyncio.run(bot.cerca(update, context))
+            finally:
+                diagnostic_logger.removeHandler(caplog.handler)
 
         assert _texts(reply) == [SEARCHING_MESSAGE, GENERIC_ERROR_MESSAGE]
         user_text = "\n".join(_texts(reply)).lower()
         assert "flightsnotfound" not in user_text and "errorhasstatus" not in user_text
-        assert "FlightsNotFound" in caplog.text             # il dettaglio e' nel log
+        diagnostic_records = [record for record in caplog.records
+                              if record.name == "flight_bot.diagnostic"]
+        anomalies = [record for record in diagnostic_records
+                     if record.diagnostic_fields.get("event") == "parse_anomaly"]
+        assert len(anomalies) == 1
+        assert anomalies[0].diagnostic_fields["exception_type"] == "FlightsNotFound"
+
+        application_records = [record for record in caplog.records
+                               if record.name == "flight_bot.bot"]
+        assert len(application_records) == 1
+        assert application_records[0].exc_info is not None
+        app_log_text = _application_log_text(caplog, "flight_bot.bot")
+        assert "FlightsNotFound" in app_log_text
+        assert "Traceback (most recent call last)" in app_log_text
+        assert "no flights found; received error" in app_log_text
 
     def test_cerca_network_timeout_gives_generic_message(self, caplog):
         update, context, reply = _update_and_context(ROUND_TRIP_ARGS)
@@ -515,6 +576,8 @@ class TestRealScraperChainOnlyNetworkMocked:
         session = MagicMock()
         session.query.return_value.filter_by.return_value.all.return_value = [_search(1), _search(2)]
         alert = AsyncMock()
+        diagnostic_logger = logging.getLogger("flight_bot.diagnostic")
+        diagnostic_logger.addHandler(caplog.handler)
         with patch.object(scheduler, "SessionLocal", return_value=session), \
              patch.object(scheduler, "Bot"), \
              patch.object(scheduler, "_sleep", new=AsyncMock()) as sleep, \
@@ -530,14 +593,28 @@ class TestRealScraperChainOnlyNetworkMocked:
                 primp.TimeoutError("operation timed out"),
                 primp.TimeoutError("operation timed out"),
             ]
-            asyncio.run(scheduler.run_scraping_cycle())      # nessuna eccezione
+            try:
+                asyncio.run(scheduler.run_scraping_cycle())  # nessuna eccezione
+            finally:
+                diagnostic_logger.removeHandler(caplog.handler)
 
         assert client.get.call_count == 4                    # ricerca 1 x3 tentativi + ricerca 2 x1
         assert sleep.await_count == 2                        # attese mockate: nessuna attesa reale
         session.add.assert_not_called()
         alert.assert_not_called()
-        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        errors = [r for r in caplog.records
+                  if r.name == "flight_bot.scheduler" and r.levelno >= logging.ERROR]
         # un solo errore definitivo per ricerca (in ordine di chiusura: la 2 subito, la 1 dopo i retry)
         assert sorted(("search_id=1" in r.getMessage(), "search_id=2" in r.getMessage())
                       for r in errors) == [(False, True), (True, False)]
-        assert "FlightsNotFound" in caplog.text
+        diagnostic_records = [record for record in caplog.records
+                              if record.name == "flight_bot.diagnostic"]
+        anomalies = [record for record in diagnostic_records
+                     if record.diagnostic_fields.get("event") == "parse_anomaly"]
+        assert len(anomalies) == 1
+        assert anomalies[0].diagnostic_fields["exception_type"] == "FlightsNotFound"
+
+        app_log_text = _application_log_text(caplog, "flight_bot.scheduler")
+        assert "FlightsNotFound" in app_log_text
+        assert "Traceback (most recent call last)" in app_log_text
+        assert "no flights found; received error" in app_log_text

@@ -43,6 +43,9 @@ stesso processo (client HTTP condiviso a livello di modulo).
 """
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
+import logging
+from urllib.parse import urlsplit
 
 from primp import Client, PrimpError
 from primp import TimeoutError as PrimpTimeoutError
@@ -52,6 +55,7 @@ from fast_flights.parser import parse
 from fast_flights.exceptions import FlightsNotFound
 
 from . import ScrapedPrice, FlightOption
+from diagnostics import diagnostic_context, emit, emit_exception
 
 GOOGLE_FLIGHTS_URL = "https://www.google.com/travel/flights"
 
@@ -112,6 +116,7 @@ def _request(method: str, url: str, **kwargs):
     try:
         response = getattr(_client, method)(url, timeout=HTTP_TIMEOUT_SECONDS, **kwargs)
     except PrimpError as exc:
+        emit_exception("http_transport_error", exc, stage="http_" + method.lower())
         raise ScraperError(
             f"Richiesta {method.upper()} a Google fallita ({type(exc).__name__})",
             timed_out=isinstance(exc, PrimpTimeoutError),    # include DNSTimeoutError
@@ -120,11 +125,22 @@ def _request(method: str, url: str, **kwargs):
         response.raise_for_status()
     except PrimpError as exc:
         status = getattr(response, "status_code", None)
+        emit_exception("http_status_error", exc, stage="http_" + method.lower(),
+                       status_code=status if isinstance(status, int) else None)
         raise ScraperError(
             f"Google ha risposto con errore HTTP "
             f"{getattr(response, 'status_code', '?')} alla richiesta {method.upper()}",
             status_code=status if isinstance(status, int) else None,
         ) from exc
+    try:
+        final_host = urlsplit(getattr(response, "url", "")).hostname
+        consent_redirect = final_host == "consent.google.com"
+        emit("http_response", stage="http_" + method.lower(),
+             status_code=getattr(response, "status_code", None)
+             if type(getattr(response, "status_code", None)) is int else None,
+             consent_redirect=consent_redirect)
+    except Exception:
+        pass
     return response
 
 
@@ -148,12 +164,27 @@ def _response_text(response) -> str:
     un corpo troncato) NON si toccano: la loro classificazione resta quella di prima.
     """
     try:
-        return response.text
+        body = response.text
     except PrimpTimeoutError as exc:             # include DNSTimeoutError
+        emit_exception("response_read_error", exc, stage="response_read")
         raise ScraperError(
             f"Lettura della risposta di Google fallita ({type(exc).__name__})",
             timed_out=True,
         ) from exc
+    except Exception as exc:
+        emit_exception("response_read_error", exc, stage="response_read")
+        raise
+    try:
+        encoded = body.encode("utf-8", errors="replace")
+        emit("response_read", stage="response_read", response_bytes=len(encoded),
+             body_sha256=hashlib.sha256(encoded).hexdigest(),
+             has_expected_marker='class="ds:1"' in body or "AF_initDataCallback" in body)
+        if not body:
+            emit("response_anomaly", level=logging.WARNING, stage="response_read",
+                 has_expected_marker=False)
+    except Exception:
+        pass
+    return body
 
 
 def _submit_consent_form(consent_html: str) -> str:
@@ -162,9 +193,11 @@ def _submit_consent_form(consent_html: str) -> str:
     POST, come farebbe un browser reale al click su "Accetta tutto". Ritorna
     l'HTML della pagina risultante.
     """
+    emit("consent_detected", stage="consent_parse")
     consent_page = LexborHTMLParser(consent_html)
     forms = consent_page.css("form")
     if not forms:
+        emit("consent_anomaly", level=logging.WARNING, stage="consent_parse")
         raise ScraperError(
             "Pagina di consenso Google senza nessun <form>: struttura della "
             "pagina cambiata rispetto a quella vista in fase di test."
@@ -181,6 +214,7 @@ def _submit_consent_form(consent_html: str) -> str:
 
     action = modulo.attributes.get("action")
     if not action:
+        emit("consent_anomaly", level=logging.WARNING, stage="consent_parse")
         raise ScraperError("Il modulo di consenso non ha un URL di invio (action).")
     if action.startswith("/"):
         action = "https://consent.google.com" + action
@@ -192,6 +226,7 @@ def _submit_consent_form(consent_html: str) -> str:
             campi[nome] = inp.attributes.get("value", "")
 
     response = _request("post", action, data=campi)
+    emit("consent_submitted", stage="consent_submit")
     return _response_text(response)
 
 
@@ -199,6 +234,7 @@ def _fetch_html(query) -> str:
     response = _request("get", GOOGLE_FLIGHTS_URL, params=query.params())
 
     if "consent.google.com" in response.url:
+        emit("consent_redirect", stage="consent_detect")
         return _submit_consent_form(_response_text(response))
 
     return _response_text(response)
@@ -249,8 +285,15 @@ def search_leg(origin: str, destination: str, date: datetime,
 
     try:
         html = _fetch_html(query)
+        if 'class="ds:1"' not in html and "AF_initDataCallback" not in html:
+            emit("parse_anomaly", level=logging.WARNING, stage="parse",
+                 has_expected_marker=False)
+        emit("parse_started", stage="parse")
         result = parse(html)
+        emit("parse_completed", stage="parse",
+             has_expected_marker=('class="ds:1"' in html or "AF_initDataCallback" in html))
     except FlightsNotFound as exc:
+        emit_exception("parse_anomaly", exc, stage="parse")
         # fast-flights solleva FlightsNotFound quando Google risponde con un
         # payload di errore ("errorHasStatus: true"), NON quando la ricerca e'
         # valida ma senza voli: in quel caso parse() restituisce una lista
@@ -263,6 +306,7 @@ def search_leg(origin: str, destination: str, date: datetime,
     except ScraperError:
         raise
     except Exception as exc:
+        emit_exception("unexpected_scraper_exception", exc, stage="parse_or_fetch")
         raise ScraperError(
             f"Analisi della pagina Google Flights fallita ({type(exc).__name__})"
         ) from exc
@@ -303,8 +347,9 @@ def scrape_price(origin: str, destination: str, departure_date: datetime,
     qualunque tratta, andata o ritorno: non viene mai convertito in None ne'
     in un prezzo parziale (vedi search_leg).
     """
-    andata = search_leg(origin, destination, departure_date,
-                         earliest_departure_hour, latest_departure_hour, direct_only)
+    with diagnostic_context(leg="outbound"):
+        andata = search_leg(origin, destination, departure_date,
+                             earliest_departure_hour, latest_departure_hour, direct_only)
     if not andata:
         return None
     piu_economica_andata = andata[0]
@@ -313,8 +358,9 @@ def scrape_price(origin: str, destination: str, departure_date: datetime,
     prezzo_totale = piu_economica_andata.price_eur
 
     if return_date:
-        ritorno = search_leg(destination, origin, return_date,
-                              earliest_return_hour, latest_return_hour, direct_only)
+        with diagnostic_context(leg="return"):
+            ritorno = search_leg(destination, origin, return_date,
+                                  earliest_return_hour, latest_return_hour, direct_only)
         if not ritorno:
             return None
         piu_economico_ritorno = ritorno[0]
@@ -354,8 +400,9 @@ def search_options(origin: str, destination: str, departure_date: datetime,
     qualunque tratta, andata o ritorno: non viene mai convertito in [] (vedi
     search_leg).
     """
-    andata = search_leg(origin, destination, departure_date, direct_only=True,
-                         max_results=max_per_leg)
+    with diagnostic_context(leg="outbound"):
+        andata = search_leg(origin, destination, departure_date, direct_only=True,
+                             max_results=max_per_leg)
     if not andata:
         return []
 
@@ -366,8 +413,9 @@ def search_options(origin: str, destination: str, departure_date: datetime,
             for o in andata[:max_results]
         ]
 
-    ritorno = search_leg(destination, origin, return_date, direct_only=True,
-                          max_results=max_per_leg)
+    with diagnostic_context(leg="return"):
+        ritorno = search_leg(destination, origin, return_date, direct_only=True,
+                              max_results=max_per_leg)
     if not ritorno:
         return []
 
